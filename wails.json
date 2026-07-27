@@ -1,0 +1,19 @@
+{
+  "name": "vmf-preupload",
+  "outputfilename": "vmf-preupload",
+  "frontend:install": "npm ci",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "http://localhost:5173",
+  "frontend:dev:serverPort": 5173,
+  "build": {
+    "frontend": "frontend",
+    "output": "build"
+  },
+  "author": {
+    "name": "VMF"
+  },
+  "info": {
+    "productName": "VMF Preupload"
+  }
+}

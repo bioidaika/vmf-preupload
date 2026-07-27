@@ -1,0 +1,29 @@
+# Go
+/build/*.exe
+/build/bin/
+/build/assets/
+
+# Frontend dependencies and compiler output
+/frontend/node_modules/
+/frontend/dist/*
+!/frontend/dist/embed-placeholder.txt
+/frontend/*.tsbuildinfo
+/frontend/vite.config.js
+/frontend/vite.config.d.ts
+/frontend/package.json.md5
+/frontend/.vite/
+/frontend/wailsjs/
+
+# Local settings and transaction journals
+*.journal.json
+*.vmf-rename-*.json
+settings.json
+.env
+.env.*
+!.env.example
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

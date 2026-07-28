@@ -109,12 +109,16 @@ go run github.com/wailsapp/wails/v2/cmd/wails@v2.12.0 dev
 5. Resolve any warning/collision, then select **Apply rename**. **Undo** uses
    the latest transaction journal.
 
-For a TV season folder, the folder receives a season-pack name while each
-episode keeps its own `SxxEyy` identity parsed from its filename. A folder
-rename moves all children with the folder; selecting a single file renames
-that media file only. Existing subfolders such as `Season 1` retain their
-relative structure. Subtitle/NFO/image sidecars are not independently renamed
-yet.
+For a selected TV season folder, the folder receives a season-pack name while
+each episode keeps its own `SxxEyy` identity. When a selected series container
+has direct children named `Season 1`/`S01`, `Season 2`/`S02`, and so on, the
+container stays in place and every recognized season folder is planned as its
+own P2P release. Nested content remains below the matching renamed season.
+
+A flat series container holding files from several seasons also stays in
+place; every file uses its own parsed season/episode instead of inheriting S01
+from the first scan. The app does not create new season directories for this
+flat layout yet. Subtitle/NFO/image sidecars are not independently renamed.
 
 ## Provider keys and local settings
 

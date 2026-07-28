@@ -37,6 +37,9 @@ export interface ScanResult {
   mediaType: MediaType
   files: ScanFile[]
   metadata: Partial<TechnicalMetadata>
+  seasons?: string[]
+  seriesRoot?: boolean
+  seasonFolderCount?: number
   warnings?: string[]
   mediaInfoText?: string
   mediaInfoJson?: unknown
@@ -61,6 +64,7 @@ export interface RenamePlan {
 export interface RenameRequest {
   rootPath: string
   metadata: TechnicalMetadata
+  metadataOverrides?: string[]
   separator: string
   preserveExistingP2P: boolean
   /** Deprecated vmf@1 compatibility field; the backend ignores it. */

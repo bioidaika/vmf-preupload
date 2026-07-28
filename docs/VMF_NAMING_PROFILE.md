@@ -55,3 +55,18 @@ Example.Show.2026.S01E02.ViE.1080p.WEBRip.DDP5.1.x264-NoGroup.mkv
 For a multi-file folder, each output file follows its own original basename.
 The output folder carries `UHD` only when every source video filename carries
 the explicit marker, preventing one episode from tagging the whole season.
+
+## TV directory topology
+
+- A selected single-season folder is one release unit and is rendered with its
+  `Sxx` marker.
+- A series container with direct `Season N`/`SNN` children is not renamed.
+  Every recognized season child is rendered independently, and episode paths
+  are mapped through that season folder's destination.
+- A flat container with files from multiple seasons is also kept in place.
+  Files retain the flat layout but are rendered with their own `SxxEyy` facts;
+  values from the first scanned episode are never reused as another file's
+  identity.
+- If a season folder conflicts with a filename (`Season 1` containing S02), or
+  two siblings resolve to the same season destination, the whole plan is
+  blocked before Apply.

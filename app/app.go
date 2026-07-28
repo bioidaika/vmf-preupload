@@ -124,6 +124,7 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 	if baseMeta.Group == "" {
 		baseMeta.Group = "NoGroup"
 	}
+	metadataOverrides := makeMetadataOverrideSet(request.MetadataOverrides)
 	preserveExistingP2P := true
 	if request.PreserveExistingP2P != nil {
 		preserveExistingP2P = *request.PreserveExistingP2P
@@ -147,16 +148,31 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 	displayItems := make([]RenameItem, 0, len(scan.Assets)+1)
 	warnings := append([]string{}, scan.Warnings...)
 	planErrors := []string{}
+	seasonLayout := tvSeasonLayout{}
+	if rootIsDir && baseMeta.Category == naming.TV {
+		seasonLayout = analyzeTVSeasonLayout(root, scan.Assets)
+		for _, message := range seasonLayout.ValidationErrors {
+			appendUnique(&planErrors, "season layout: "+message)
+		}
+		for _, message := range tvSeasonLayoutWarnings(seasonLayout) {
+			appendUnique(&warnings, message)
+		}
+	}
 
-	// A folder is renamed to the common release name. For a TV folder with
-	// several episodes, omit the episode title/number from the folder name and
-	// retain the season marker as a season-pack identity.
+	// A series root is a container for multiple upload units, so keep it in
+	// place and rename each recognized season directory below it. A selected
+	// single-season folder remains one release unit and follows normal naming.
 	if rootIsDir {
-		if preserveExistingP2P && metadata.IsP2PReleaseFolderName(filepath.Base(root)) {
+		if seasonLayout.SeriesRoot {
+			displayItems = append(displayItems, RenameItem{OldPath: root, NewPath: root, Kind: "folder", Status: "same"})
+		} else if preserveExistingP2P && metadata.IsP2PReleaseFolderName(filepath.Base(root)) {
 			displayItems = append(displayItems, RenameItem{OldPath: root, NewPath: root, Kind: "folder", Status: "preserved"})
 		} else {
 			folderMeta := baseMeta
-			if folderMeta.Category == naming.TV && len(scan.Assets) > 1 {
+			if folderMeta.Category == naming.TV && len(seasonLayout.Seasons) == 1 {
+				folderMeta.Season = seasonLayout.Seasons[0]
+			}
+			if folderMeta.Category == naming.TV && seasonLayout.VideoCount > 1 {
 				folderMeta.Episode = ""
 				folderMeta.EpisodeTitle = ""
 			}
@@ -174,25 +190,88 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 		}
 	}
 
+	type seasonRenameTarget struct {
+		directory       tvSeasonDirectory
+		destination     string
+		destinationBase string
+		status          string
+	}
+	seasonDestinations := map[string]string{}
+	seasonDestinationCounts := map[string]int{}
+	seasonTargets := make([]seasonRenameTarget, 0, len(seasonLayout.Directories))
+	if rootIsDir && baseMeta.Category == naming.TV {
+		for _, seasonDirectory := range seasonLayout.Directories {
+			seasonMeta := baseMeta
+			if len(seasonDirectory.Assets) > 0 {
+				seasonMeta = mergeAssetMetadata(baseMeta, seasonDirectory.Assets[0])
+				seasonMeta = preferAssetTechnicalMetadata(seasonMeta, seasonDirectory.Assets[0], metadataOverrides)
+			}
+			seasonMeta.Season = seasonDirectory.Season
+			seasonMeta.Episode = ""
+			seasonMeta.EpisodeTitle = ""
+			seasonMeta.UHD = allVideoAssetsHaveExplicitUHD(seasonDirectory.Assets)
+
+			sourceBase := filepath.Base(seasonDirectory.Source)
+			destinationBase := sourceBase
+			status := "preserved"
+			if !preserveExistingP2P || !metadata.IsP2PReleaseFolderName(sourceBase) {
+				var nameWarnings []naming.Warning
+				destinationBase, nameWarnings = naming.Render(seasonMeta, profile)
+				warnings = appendNamingWarnings(warnings, nameWarnings)
+				status = "same"
+				if destinationBase == "" {
+					appendUnique(&planErrors, "could not render season folder "+seasonDirectory.Source)
+					continue
+				}
+			}
+
+			destination := filepath.Join(newRoot, destinationBase)
+			sourceKey := appPathKey(seasonDirectory.Source)
+			destinationKey := appPathKey(destination)
+			seasonDestinations[sourceKey] = destination
+			seasonDestinationCounts[destinationKey]++
+			seasonTargets = append(seasonTargets, seasonRenameTarget{
+				directory:       seasonDirectory,
+				destination:     destination,
+				destinationBase: destinationBase,
+				status:          status,
+			})
+		}
+
+		for _, target := range seasonTargets {
+			destinationKey := appPathKey(target.destination)
+			if seasonDestinationCounts[destinationKey] > 1 {
+				appendUnique(&planErrors, "duplicate season destination: "+target.destination)
+				displayItems = append(displayItems, RenameItem{OldPath: target.directory.Source, NewPath: target.destination, Kind: "folder", Status: "conflict"})
+				continue
+			}
+			sourceBase := filepath.Base(target.directory.Source)
+			if target.status == "preserved" {
+				displayItems = append(displayItems, RenameItem{OldPath: target.directory.Source, NewPath: target.destination, Kind: "folder", Status: target.status})
+			} else if sourceBase == target.destinationBase {
+				displayItems = append(displayItems, RenameItem{OldPath: target.directory.Source, NewPath: target.destination, Kind: "folder", Status: "same"})
+			} else {
+				requests = append(requests, rename.RenameRequest{Source: target.directory.Source, Destination: target.destination})
+			}
+		}
+	}
+
 	seenDest := map[string]bool{}
+	conflictingFileDestinations := map[string]bool{}
 	for _, asset := range scan.Assets {
 		if !isVideoAsset(asset) {
 			continue
 		}
 		dir := filepath.Dir(asset.Path)
 		if rootIsDir {
-			relativeDir := filepath.Dir(asset.RelativePath)
-			if relativeDir == "." || relativeDir == "" {
-				dir = newRoot
-			} else {
-				dir = filepath.Join(newRoot, relativeDir)
-			}
+			dir = mappedAssetDirectory(asset, newRoot, seasonLayout, seasonDestinations)
 		}
 		if preserveExistingP2P && metadata.IsP2PReleaseName(asset.Name) {
 			destination := filepath.Join(dir, asset.Name)
 			key := strings.ToLower(filepath.Clean(destination))
 			if seenDest[key] {
 				appendUnique(&planErrors, "duplicate destination: "+destination)
+				conflictingFileDestinations[key] = true
 				displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "conflict"})
 				continue
 			}
@@ -201,19 +280,29 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 			continue
 		}
 		meta := mergeAssetMetadata(baseMeta, asset)
-		if baseMeta.Category == naming.TV && len(scan.Assets) > 1 {
-			// A season folder contains multiple episodes. Preserve each asset's
-			// parsed episode identity instead of reusing the first episode selected
-			// in the folder-level UI metadata.
-			if asset.Content.Season != "" {
-				meta.Season = asset.Content.Season
+		if baseMeta.Category == naming.TV {
+			assetKey := appPathKey(asset.Path)
+			if season := seasonLayout.AssetSeason[assetKey]; season != "" {
+				meta.Season = season
 			}
-			if asset.Content.Episode != "" {
-				meta.Episode = asset.Content.Episode
+			if episode := seasonLayout.AssetEpisode[assetKey]; episode != "" {
+				meta.Episode = episode
 			}
-			if asset.Content.EpisodeTitle != "" {
+			if seasonLayout.VideoCount > 1 {
+				// Never reuse the first scanned episode for another asset. Missing
+				// per-file identity remains missing and is surfaced as a collision or
+				// layout error instead of silently becoming S01E01.
+				if seasonLayout.AssetEpisode[assetKey] == "" {
+					meta.Episode = ""
+				}
 				meta.EpisodeTitle = asset.Content.EpisodeTitle
+				meta = preferAssetTechnicalMetadata(meta, asset, metadataOverrides)
 			}
+		}
+		if baseMeta.Category == naming.TV && seasonLayout.VideoCount > 1 && strings.TrimSpace(meta.Episode) == "" {
+			appendUnique(&planErrors, "season layout: could not determine an episode for "+asset.Name)
+			displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: asset.Path, Kind: "file", Status: "conflict"})
+			continue
 		}
 		name, nameWarnings := naming.Render(meta, profile)
 		warnings = appendNamingWarnings(warnings, nameWarnings)
@@ -224,11 +313,12 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 		key := strings.ToLower(filepath.Clean(destination))
 		if seenDest[key] {
 			appendUnique(&planErrors, "duplicate destination: "+destination)
+			conflictingFileDestinations[key] = true
 			displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "conflict"})
 			continue
 		}
 		seenDest[key] = true
-		if filepath.Clean(asset.Path) == filepath.Clean(destination) {
+		if filepath.Base(asset.Path) == filepath.Base(destination) {
 			displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "same"})
 		} else {
 			requests = append(requests, rename.RenameRequest{Source: asset.Path, Destination: destination})
@@ -250,6 +340,12 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 		warnings = append(warnings, issue.Code+": "+issue.Message)
 	}
 	result := a.toRenamePlan(plan, warnings, report, displayItems)
+	for index := range result.Items {
+		item := &result.Items[index]
+		if item.Kind == "file" && conflictingFileDestinations[appPathKey(item.NewPath)] {
+			item.Status = "conflict"
+		}
+	}
 	for _, message := range planErrors {
 		appendUnique(&result.Errors, message)
 	}
@@ -338,7 +434,7 @@ func (a *App) toScanResult(result api.ScanResult) ScanResult {
 	if fallbackGroup == "" {
 		fallbackGroup = "NoGroup"
 	}
-	out := ScanResult{RootPath: result.Root, Files: []ScanFile{}, Warnings: []string{}, Metadata: TechnicalMetadata{MediaType: "movie", Group: fallbackGroup}}
+	out := ScanResult{RootPath: result.Root, Files: []ScanFile{}, Seasons: []string{}, Warnings: []string{}, Metadata: TechnicalMetadata{MediaType: "movie", Group: fallbackGroup}}
 	for _, warning := range result.Warnings {
 		appendUnique(&out.Warnings, warning)
 	}
@@ -379,6 +475,37 @@ func (a *App) toScanResult(result api.ScanResult) ScanResult {
 		out.Metadata.MediaType = "movie"
 	}
 	out.MediaType = out.Metadata.MediaType
+	layout := analyzeTVSeasonLayout(result.Root, result.Assets)
+	if out.Metadata.MediaType == "tv" || len(layout.Seasons) > 0 {
+		out.Metadata.MediaType = "tv"
+		out.MediaType = "tv"
+		out.Seasons = append(out.Seasons, layout.Seasons...)
+		out.SeriesRoot = layout.SeriesRoot
+		out.SeasonFolderCount = len(layout.Directories)
+		chosenSeason, chosenEpisode, chosenEpisodeTitle := "", "", ""
+		for _, asset := range result.Assets {
+			assetKey := appPathKey(asset.Path)
+			season, episode := layout.AssetSeason[assetKey], layout.AssetEpisode[assetKey]
+			if season != "" && episode != "" {
+				chosenSeason, chosenEpisode, chosenEpisodeTitle = season, episode, asset.Content.EpisodeTitle
+				break
+			}
+			if chosenSeason == "" && chosenEpisode == "" && (season != "" || episode != "") {
+				chosenSeason, chosenEpisode, chosenEpisodeTitle = season, episode, asset.Content.EpisodeTitle
+			}
+		}
+		if chosenSeason != "" || chosenEpisode != "" {
+			out.Metadata.Season = chosenSeason
+			out.Metadata.Episode = chosenEpisode
+			out.Metadata.EpisodeTitle = chosenEpisodeTitle
+		}
+		for _, message := range layout.ValidationErrors {
+			appendUnique(&out.Warnings, "season layout: "+message)
+		}
+		for _, message := range tvSeasonLayoutWarnings(layout) {
+			appendUnique(&out.Warnings, message)
+		}
+	}
 	// Folder-level metadata drives the live suggested basename. Keep it aligned
 	// with PreviewRename: a pack is UHD only when every source video basename
 	// carries the explicit marker. A single selected file naturally follows
@@ -493,6 +620,91 @@ func mergeAssetMetadata(base naming.Metadata, asset api.Asset) naming.Metadata {
 		}
 	}
 	return meta
+}
+
+// preferAssetTechnicalMetadata prevents the first scanned episode from
+// becoming the technical template for every later season. Identity/provider
+// fields and the user's output group remain pack-level, while facts proven by
+// each asset's filename or MediaInfo take precedence when available.
+func preferAssetTechnicalMetadata(meta naming.Metadata, asset api.Asset, overrides map[string]bool) naming.Metadata {
+	content := asset.Content
+	scanSucceeded := strings.TrimSpace(asset.Technical.RawJSON) != ""
+	if !overrides["source"] {
+		// An empty value is meaningful provenance: without filename evidence,
+		// do not reuse the source parsed from the first scanned episode.
+		meta.Source = content.Source
+	}
+	// A service is filename evidence only. Clearing it here is intentional so
+	// NF/AMZN from the first episode cannot leak into an untagged episode.
+	if !overrides["service"] {
+		meta.Service = content.Service
+	}
+	if !overrides["releasetype"] {
+		// ParseFilename uses ENCODE as a generic fallback, so accept the parsed
+		// type only when the basename actually contains release-type evidence.
+		meta.ReleaseType = ""
+		if hasReleaseTypeEvidence(asset.Name) && content.ReleaseType != "" {
+			meta.ReleaseType = content.ReleaseType
+		}
+	}
+	if !overrides["resolution"] && (scanSucceeded || content.Resolution != "") {
+		meta.Resolution = content.Resolution
+	}
+	if !overrides["videocodec"] && (scanSucceeded || content.VideoCodec != "") {
+		meta.VideoCodec = content.VideoCodec
+	}
+	if !overrides["videoencode"] {
+		if overrides["videocodec"] {
+			meta.VideoEncode = ""
+		} else if scanSucceeded || content.VideoCodec != "" {
+			meta.VideoEncode = content.VideoEncode
+		}
+	}
+	if !overrides["hdr"] && (scanSucceeded || content.HDR != "") {
+		meta.HDR = content.HDR
+	}
+	if !overrides["audio"] && (scanSucceeded || content.Audio != "") {
+		meta.Audio = content.Audio
+	}
+
+	assetTracks := []naming.AudioTrack{}
+	for _, track := range asset.Technical.Tracks {
+		if strings.EqualFold(track.Type, "Audio") {
+			assetTracks = append(assetTracks, naming.AudioTrack{Language: track.Language, Title: track.Title, Codec: track.Codec, Channels: track.Channels, Main: track.Default, Atmos: track.Atmos})
+		}
+	}
+	if !overrides["languages"] && (scanSucceeded || len(assetTracks) > 0) {
+		meta.AudioTracks = assetTracks
+	} else if overrides["languages"] {
+		requestedTracks := []naming.AudioTrack{}
+		for _, track := range meta.AudioTracks {
+			if track.Codec == "" && track.Channels == "" && track.Title == "" {
+				requestedTracks = append(requestedTracks, track)
+			}
+		}
+		meta.AudioTracks = requestedTracks
+	}
+	return meta
+}
+
+func makeMetadataOverrideSet(values []string) map[string]bool {
+	result := map[string]bool{}
+	for _, value := range values {
+		if value = strings.ToLower(strings.TrimSpace(value)); value != "" {
+			result[value] = true
+		}
+	}
+	return result
+}
+
+func hasReleaseTypeEvidence(filename string) bool {
+	lower := strings.ToLower(filename)
+	for _, marker := range []string{"web-dl", "webdl", "web.dl", "webrip", "web-rip", "remux", "bluray", "blu-ray", "bdrip", "brrip", "hdtv"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func assetHasExplicitUHD(asset api.Asset) bool {

@@ -584,20 +584,25 @@ func TestPreviewGenericFolderCarriesProtectedChildAtRelativeSeasonPath(t *testin
 		t.Fatalf("folder-only plan changeCount=%d canApply=%t items=%#v", plan.ChangeCount, plan.CanApply, plan.Items)
 	}
 
-	var folderItem, protectedItem *RenameItem
+	var rootItem, seasonItem, protectedItem *RenameItem
 	for index := range plan.Items {
 		item := &plan.Items[index]
 		switch {
-		case item.Kind == "folder" && item.Status == "ready":
-			folderItem = item
+		case item.OldPath == root && item.Kind == "folder":
+			rootItem = item
+		case item.OldPath == seasonDir && item.Kind == "folder":
+			seasonItem = item
 		case item.Kind == "file" && item.Status == "preserved":
 			protectedItem = item
 		}
 	}
-	if folderItem == nil || protectedItem == nil {
-		t.Fatalf("want one folder rename and one protected child: %#v", plan.Items)
+	if rootItem == nil || seasonItem == nil || protectedItem == nil {
+		t.Fatalf("want unchanged series root, renamed season and protected child: %#v", plan.Items)
 	}
-	wantChildPath := filepath.Join(folderItem.NewPath, "Season 1", originalName)
+	if rootItem.NewPath != root || rootItem.Status != "same" {
+		t.Fatalf("series container must remain in place: %#v", rootItem)
+	}
+	wantChildPath := filepath.Join(seasonItem.NewPath, originalName)
 	if protectedItem.OldPath != originalPath || protectedItem.NewPath != wantChildPath {
 		t.Fatalf("protected child relative path changed: got %#v want destination %q", protectedItem, wantChildPath)
 	}
@@ -649,11 +654,17 @@ func TestPreviewMixedFolderPreservesP2PAndRendersRawEpisode(t *testing.T) {
 		t.Fatalf("mixed plan changeCount=%d canApply=%t items=%#v", plan.ChangeCount, plan.CanApply, plan.Items)
 	}
 
+	seasonDestination := ""
+	for _, item := range plan.Items {
+		if item.OldPath == seasonDir && item.Kind == "folder" {
+			seasonDestination = item.NewPath
+		}
+	}
 	foundProtected, foundRawReady := false, false
 	for _, item := range plan.Items {
 		switch item.OldPath {
 		case protectedPath:
-			foundProtected = item.Status == "preserved" && filepath.Base(item.NewPath) == protectedName && filepath.Base(filepath.Dir(item.NewPath)) == "Season 1"
+			foundProtected = item.Status == "preserved" && filepath.Base(item.NewPath) == protectedName && filepath.Clean(filepath.Dir(item.NewPath)) == filepath.Clean(seasonDestination)
 		case rawPath:
 			foundRawReady = item.Status == "ready" && strings.Contains(filepath.Base(item.NewPath), ".S01E02.")
 		}
@@ -689,14 +700,17 @@ func TestPreviewBlocksPartialPlanWhenDestinationsCollide(t *testing.T) {
 	if len(plan.Errors) == 0 || plan.CanApply {
 		t.Fatalf("collision must block the complete plan: %#v", plan)
 	}
-	foundConflict := false
+	fileItems, conflictingFiles := 0, 0
 	for _, item := range plan.Items {
-		if item.Status == "conflict" {
-			foundConflict = true
+		if item.Kind == "file" {
+			fileItems++
+			if item.Status == "conflict" {
+				conflictingFiles++
+			}
 		}
 	}
-	if !foundConflict {
-		t.Fatalf("collision is not visible in preview items: %#v", plan.Items)
+	if fileItems != 2 || conflictingFiles != fileItems {
+		t.Fatalf("every colliding file must be visible as a conflict: %#v", plan.Items)
 	}
 	if err := application.ApplyRename(plan); err == nil || !strings.Contains(strings.ToLower(err.Error()), "unresolved") {
 		t.Fatalf("backend must reject a partial collision plan: %v", err)

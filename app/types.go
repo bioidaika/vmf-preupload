@@ -35,10 +35,13 @@ type ScanFile struct {
 }
 
 type ScanResult struct {
-	RootPath  string            `json:"rootPath"`
-	MediaType string            `json:"mediaType"`
-	Files     []ScanFile        `json:"files"`
-	Metadata  TechnicalMetadata `json:"metadata"`
+	RootPath          string            `json:"rootPath"`
+	MediaType         string            `json:"mediaType"`
+	Files             []ScanFile        `json:"files"`
+	Metadata          TechnicalMetadata `json:"metadata"`
+	Seasons           []string          `json:"seasons"`
+	SeriesRoot        bool              `json:"seriesRoot"`
+	SeasonFolderCount int               `json:"seasonFolderCount"`
 	// Warnings contains non-fatal scanner/MediaInfo diagnostics. Keeping these
 	// at the Wails boundary lets the UI distinguish a complete technical scan
 	// from filename-only fallback data.
@@ -67,9 +70,10 @@ type RenamePlan struct {
 }
 
 type RenameRequest struct {
-	RootPath  string            `json:"rootPath"`
-	Metadata  TechnicalMetadata `json:"metadata"`
-	Separator string            `json:"separator"`
+	RootPath          string            `json:"rootPath"`
+	Metadata          TechnicalMetadata `json:"metadata"`
+	MetadataOverrides []string          `json:"metadataOverrides,omitempty"`
+	Separator         string            `json:"separator"`
 	// A pointer keeps old clients safe: an omitted value defaults to true.
 	PreserveExistingP2P *bool `json:"preserveExistingP2P,omitempty"`
 	// IncludeUHD is accepted for vmf@1 client compatibility but deliberately

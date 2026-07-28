@@ -292,6 +292,7 @@ export interface RenamerState {
 export function useRenamer(): RenamerState {
   const [settings, setSettings] = useState(defaultSettings)
   const [metadata, setMetadata] = useState(defaultMetadata)
+  const [metadataOverrides, setMetadataOverrides] = useState<string[]>([])
   const [scan, setScan] = useState<ScanResult | null>(() => syntheticScan(''))
   const [plan, setPlan] = useState<RenamePlan | null>(null)
   const [selectedPath, setSelectedPath] = useState('C:\\Media\\Example.Movie.2026.mkv')
@@ -313,6 +314,7 @@ export function useRenamer(): RenamerState {
 
   const updateMetadata = useCallback((patch: Partial<TechnicalMetadata>) => {
     setMetadata((current) => ({ ...current, ...patch }))
+    setMetadataOverrides((current) => Array.from(new Set([...current, ...Object.keys(patch)])))
     setPlan(null)
     setApplied(false)
   }, [])
@@ -338,10 +340,14 @@ export function useRenamer(): RenamerState {
         videoEncode: result.metadata.videoEncode ?? '',
         uhd: result.metadata.uhd === true,
       }))
+      setMetadataOverrides([])
       setPlan(null)
       setApplied(false)
       const warningCount = result.warnings?.length ?? 0
-      setNotice(`Scanned ${result.files.length} item${result.files.length === 1 ? '' : 's'}${warningCount ? ` with ${warningCount} warning${warningCount === 1 ? '' : 's'}` : ''}.`)
+      const seasonSummary = result.seriesRoot && result.seasons?.length
+        ? ` across ${result.seasons.length} season${result.seasons.length === 1 ? '' : 's'}${result.seasonFolderCount ? ` in ${result.seasonFolderCount} season folder${result.seasonFolderCount === 1 ? '' : 's'}` : ''}`
+        : ''
+      setNotice(`Scanned ${result.files.length} item${result.files.length === 1 ? '' : 's'}${seasonSummary}${warningCount ? ` with ${warningCount} warning${warningCount === 1 ? '' : 's'}` : ''}.`)
     } catch (cause) {
       if (isBridgeError(cause)) {
         // Browser-only hosts have no filesystem bridge. Keep the design-time
@@ -351,6 +357,7 @@ export function useRenamer(): RenamerState {
         const result = syntheticScan(path)
         setScan(result)
         setMetadata((current) => ({ ...current, ...result.metadata, videoEncode: result.metadata.videoEncode ?? '', uhd: result.metadata.uhd === true }))
+        setMetadataOverrides([])
         setPlan(null)
         setApplied(false)
         setNotice('Browser preview: showing a synthetic MediaInfo result.')
@@ -394,9 +401,10 @@ export function useRenamer(): RenamerState {
   const request = useMemo<RenameRequest>(() => ({
     rootPath: selectedPath,
     metadata: { ...metadata, group: metadata.group || settings.group },
+    metadataOverrides,
     separator: settings.separator,
     preserveExistingP2P: settings.preserveExistingP2P,
-  }), [metadata, selectedPath, settings])
+  }), [metadata, metadataOverrides, selectedPath, settings])
 
   const preview = useCallback(async () => {
     setBusy(true)

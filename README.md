@@ -8,6 +8,9 @@ filesystem change is made.
 The first milestone is deliberately conservative:
 
 - the default profile uses dot-separated tokens and falls back to `-NoGroup`;
+- an existing, high-confidence grouped P2P release name is preserved exactly
+  by default; disable **Preserve existing P2P releases** only when intentionally
+  forcing the VMF renderer;
 - service tokens are retained only when they are evidenced in the old filename
   or entered explicitly;
 - `UHD` is retained only when the original video filename contains a
@@ -15,6 +18,9 @@ The first milestone is deliberately conservative:
   MediaInfo, and parent-folder names never create it;
 - `WEB-DL`, `WEBRip`, `REMUX`, and `ENCODE` are naming modes (the app does not
   transcode or remux media);
+- rebuilt names use release-specific video spelling: `AVC`/`HEVC` for REMUX,
+  `H.264`/`H.265` for WEB-DL, and `x264`/`x265` for ENCODE/WEBRip only when the
+  encoder library is evidenced by MediaInfo;
 - apply is a two-phase rename transaction with a journal that can be undone.
 
 ## Included runtime
@@ -106,8 +112,9 @@ go run github.com/wailsapp/wails/v2/cmd/wails@v2.12.0 dev
 For a TV season folder, the folder receives a season-pack name while each
 episode keeps its own `SxxEyy` identity parsed from its filename. A folder
 rename moves all children with the folder; selecting a single file renames
-that media file only. Subtitle/NFO/image sidecars are not independently
-renamed yet.
+that media file only. Existing subfolders such as `Season 1` retain their
+relative structure. Subtitle/NFO/image sidecars are not independently renamed
+yet.
 
 ## Provider keys and local settings
 
@@ -140,6 +147,12 @@ The versioned profile and examples are documented in
 normalized facts and does not invent a source, service, edition, or release
 group from a codec alone. `upbrr` was consulted as a behavior reference; it is
 not a runtime dependency.
+
+The preservation classifier is intentionally conservative and order
+independent: it requires a real trailing release group, resolution, a movie
+year or TV marker, and a release-type-specific codec/source signature. A
+preserved item is shown in the plan but creates no rename operation; Apply is
+disabled when the complete plan contains no changes.
 
 ## Safety and current limits
 

@@ -14,13 +14,13 @@ func TestRenderCategoryAndReleaseTypeMatrix(t *testing.T) {
 		episode     string
 		want        string
 	}{
-		{name: "movie webdl", category: Movie, releaseType: WebDL, want: "Sample.Title.2024.1080p.NF.WEB-DL.AAC2.0.HDR.x264-Team"},
+		{name: "movie webdl", category: Movie, releaseType: WebDL, want: "Sample.Title.2024.1080p.NF.WEB-DL.AAC2.0.HDR.H.264-Team"},
 		{name: "movie webrip", category: Movie, releaseType: WebRip, want: "Sample.Title.2024.1080p.NF.WEBRip.AAC2.0.HDR.x264-Team"},
-		{name: "movie remux", category: Movie, releaseType: Remux, want: "Sample.Title.2024.1080p.BluRay.REMUX.HDR.H.264.AAC2.0-Team"},
+		{name: "movie remux", category: Movie, releaseType: Remux, want: "Sample.Title.2024.1080p.BluRay.REMUX.HDR.AVC.AAC2.0-Team"},
 		{name: "movie encode", category: Movie, releaseType: Encode, want: "Sample.Title.2024.1080p.BluRay.AAC2.0.HDR.x264-Team"},
-		{name: "tv webdl", category: TV, releaseType: WebDL, season: "1", episode: "2", want: "Sample.Title.2024.S01E02.1080p.NF.WEB-DL.AAC2.0.HDR.x264-Team"},
+		{name: "tv webdl", category: TV, releaseType: WebDL, season: "1", episode: "2", want: "Sample.Title.2024.S01E02.1080p.NF.WEB-DL.AAC2.0.HDR.H.264-Team"},
 		{name: "tv webrip", category: TV, releaseType: WebRip, season: "1", episode: "2", want: "Sample.Title.2024.S01E02.1080p.NF.WEBRip.AAC2.0.HDR.x264-Team"},
-		{name: "tv remux", category: TV, releaseType: Remux, season: "1", episode: "2", want: "Sample.Title.2024.S01E02.1080p.BluRay.REMUX.HDR.H.264.AAC2.0-Team"},
+		{name: "tv remux", category: TV, releaseType: Remux, season: "1", episode: "2", want: "Sample.Title.2024.S01E02.1080p.BluRay.REMUX.HDR.AVC.AAC2.0-Team"},
 		{name: "tv encode", category: TV, releaseType: Encode, season: "1", episode: "2", want: "Sample.Title.2024.S01E02.1080p.BluRay.AAC2.0.HDR.x264-Team"},
 	}
 
@@ -154,7 +154,7 @@ func TestRenderTVRemuxPlacesEpisodeAndTechnicalFields(t *testing.T) {
 		VideoCodec:   "H.265",
 		Audio:        "TrueHD.7.1.Atmos",
 	}, DefaultProfile())
-	want := "Example.Show.2024.S01E02.The.Beginning.2160p.BluRay.REMUX.HDR.H.265.TrueHD.7.1.Atmos-NoGroup"
+	want := "Example.Show.2024.S01E02.The.Beginning.2160p.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.Atmos-NoGroup"
 	if got != want {
 		t.Fatalf("Render() = %q, want %q", got, want)
 	}
@@ -252,6 +252,68 @@ func TestVMFTagStrongestAndExistingFallback(t *testing.T) {
 	}
 	if got := VMFTag(Metadata{ExistingName: "Show.S01E01.ViE.DUB.1080p.WEBRip-NoGroup"}); got != "ViE.DUB" {
 		t.Fatalf("VMFTag(existing) = %q, want ViE.DUB", got)
+	}
+}
+
+func TestVideoTokenUsesReleaseTypeConvention(t *testing.T) {
+	tests := []struct {
+		name        string
+		releaseType string
+		codec       string
+		encode      string
+		want        string
+	}{
+		{name: "remux avc", releaseType: Remux, codec: "H.264", encode: "x264", want: "AVC"},
+		{name: "remux hevc", releaseType: Remux, codec: "H.265", encode: "x265", want: "HEVC"},
+		{name: "encode x264", releaseType: Encode, codec: "AVC", encode: "x264", want: "x264"},
+		{name: "encode x265", releaseType: Encode, codec: "HEVC", encode: "x265", want: "x265"},
+		{name: "encode without encoder proof", releaseType: Encode, codec: "AVC", want: "H.264"},
+		{name: "web dl h264", releaseType: WebDL, codec: "AVC", encode: "x264", want: "H.264"},
+		{name: "web dl h265", releaseType: WebDL, codec: "HEVC", encode: "x265", want: "H.265"},
+		{name: "web rip x264", releaseType: WebRip, codec: "AVC", encode: "x264", want: "x264"},
+		{name: "web rip x265", releaseType: WebRip, codec: "HEVC", encode: "x265", want: "x265"},
+		{name: "web rip without encoder proof", releaseType: WebRip, codec: "HEVC", want: "H.265"},
+		{name: "remux mpeg two", releaseType: Remux, codec: "MPEG Video", want: "MPEG-2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := videoTokenForRelease(tt.releaseType, tt.codec, tt.encode); got != tt.want {
+				t.Fatalf("videoTokenForRelease()=%q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRenderRetainsMultiEpisodeMarker(t *testing.T) {
+	got, _ := Render(Metadata{
+		Category: TV, ReleaseType: WebDL, Title: "Example Show", Season: "01", Episode: "E01E02",
+		Resolution: "1080p", VideoCodec: "H.264", Group: "NoGroup",
+	}, DefaultProfile())
+	want := "Example.Show.S01E01E02.1080p.WEB-DL.H.264-NoGroup"
+	if got != want {
+		t.Fatalf("Render()=%q want %q", got, want)
+	}
+}
+
+func TestRenderNormalizesSpeakerLayoutToChannelCount(t *testing.T) {
+	got, _ := Render(Metadata{
+		Category:     TV,
+		ReleaseType:  Remux,
+		Title:        "Gotham",
+		Season:       "1",
+		Episode:      "1",
+		EpisodeTitle: "Pilot",
+		Resolution:   "1080p",
+		VideoCodec:   "AVC",
+		AudioTracks:  []AudioTrack{{Codec: "DTS-HD.MA", ChannelLayout: "C L R Ls Rs LFE", Main: true}},
+		Group:        "FraMeSToR",
+	}, DefaultProfile())
+	want := "Gotham.S01E01.Pilot.1080p.REMUX.AVC.DTS-HD.MA.5.1-FraMeSToR"
+	if got != want {
+		t.Fatalf("Render()=%q want %q", got, want)
+	}
+	if strings.Contains(got, "C.L.R") || strings.Contains(got, "LFE") {
+		t.Fatalf("speaker positions leaked into release name: %q", got)
 	}
 }
 

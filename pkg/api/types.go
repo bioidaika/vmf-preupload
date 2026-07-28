@@ -11,6 +11,10 @@ type Settings struct {
 	TVDBPIN      string `json:"tvdbPin,omitempty"`
 	ReleaseGroup string `json:"releaseGroup"`
 	Separator    string `json:"separator"`
+	// PreserveExistingP2P keeps a high-confidence, grouped release basename
+	// byte-for-byte instead of attributing a newly rendered convention to the
+	// original release group.
+	PreserveExistingP2P bool `json:"preserveExistingP2P"`
 	// IncludeUHD is retained for old settings files and ignored. Only an
 	// explicit UHD/Ultra HD marker in the original filename is preserved.
 	IncludeUHD   bool   `json:"includeUhd,omitempty"`

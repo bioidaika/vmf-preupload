@@ -56,8 +56,13 @@ function hintsFromFilename(path: string): Partial<TechnicalMetadata> {
   if (/(?:^|[. _-])(?:UHD|ULTRA[. _-]+HD)(?:$|[. _-])/i.test(stem)) hints.uhd = true
   if (/\b(?:DV|Dolby.Vision)\b/i.test(name)) hints.hdr = 'DV'
   else if (/\b(?:HDR10\+?|HDR)\b/i.test(name)) hints.hdr = name.match(/\bHDR10\+?\b/i)?.[0] ?? 'HDR'
-  if (/\b(?:x265|h\.265|hevc)\b/i.test(name)) hints.videoCodec = 'H.265'
-  else if (/\b(?:x264|h\.264|avc)\b/i.test(name)) hints.videoCodec = 'H.264'
+  if (/\b(?:x265|h\.265|hevc)\b/i.test(name)) {
+    hints.videoCodec = 'H.265'
+    if (/\bx265\b/i.test(name)) hints.videoEncode = 'x265'
+  } else if (/\b(?:x264|h\.264|avc)\b/i.test(name)) {
+    hints.videoCodec = 'H.264'
+    if (/\bx264\b/i.test(name)) hints.videoEncode = 'x264'
+  }
   const group = name.match(/-([A-Za-z0-9][A-Za-z0-9_]{0,30})(?:\.[^.]+)?$/)
   const hasReleaseEvidence = /(?:WEB[- .]?DL|WEBRip|REMUX|BluRay|HDTV|x264|x265|H\.26[45]|\b(?:19|20)\d{2}\b|\b\d{3,4}p\b)/i.test(name)
   if (group?.[1] && hasReleaseEvidence && !/^(?:DL|WEB|HDR|H|x26[45])$/i.test(group[1])) hints.group = group[1]
@@ -73,6 +78,37 @@ function basename(path: string): string {
   return path.split(/[\\/]/).pop() ?? path
 }
 
+// Browser-preview counterpart of the backend's conservative classifier. It
+// exists only for the design-time fallback; the Wails backend remains
+// authoritative for real files.
+function isP2PReleaseName(path: string): boolean {
+  const stem = basename(path).replace(/\.[A-Za-z0-9]{2,5}$/, '')
+  const group = stem.match(/-([A-Za-z0-9][A-Za-z0-9_]{0,40})$/)?.[1]
+  if (!group || /^(?:NoGroup|NoGrp|Unknown|UNK|Group|WEB|DL|HD|HDR|DV)$/i.test(group)) return false
+  const body = stem.slice(0, -(group.length + 1))
+  const resolution = body.match(/(?:^|[. _-])(?:4320|2160|1440|1080|720|576|480)[pi](?:$|[. _-])/i)
+  if (!resolution || resolution.index === undefined) return false
+  const identity = body.slice(0, resolution.index)
+  const fields = identity.split(/[. _-]+/).filter(Boolean)
+  let identityIndex = -1
+  for (let index = fields.length - 1; index >= 0; index -= 1) {
+    if (/^(?:(?:19|20)\d{2}|S\d{1,2}(?:E\d{1,4})*)$/i.test(fields[index])) {
+      identityIndex = index
+      break
+    }
+  }
+  if (identityIndex < 0 || !fields.some((field, index) => index !== identityIndex && /[\p{L}\p{N}]/u.test(field))) return false
+  const technical = body.slice(resolution.index)
+  if (/(?:^|[. _-])REMUX(?:$|[. _-])/i.test(technical)) {
+    return /(?:^|[. _-])(?:AVC|HEVC|VC-?1|MPEG-?2|H[. ]?26[45])(?:$|[. _-])/i.test(technical)
+  }
+  if (/(?:^|[. _-])WEB(?:[. _-]?(?:DL|Rip))?(?:$|[. _-])/i.test(technical)) {
+    return /(?:^|[. _-])(?:AVC|HEVC|AV1|VP9|x26[45]|H[. ]?26[45])(?:$|[. _-])/i.test(technical)
+  }
+  return /(?:^|[. _-])(?:BluRay|Blu-Ray|BDRip|BRRip|HDTV)(?:$|[. _-])/i.test(technical)
+    && /(?:^|[. _-])(?:x264|x265|AV1|XviD)(?:$|[. _-])/i.test(technical)
+}
+
 function parentPath(path: string): string {
   const parts = path.split(/[\\/]/)
   parts.pop()
@@ -83,6 +119,20 @@ function parentPath(path: string): string {
 // explicit marker parsed from the original basename may supply UHD.
 function shouldIncludeUhd(metadata: TechnicalMetadata): boolean {
   return metadata.uhd === true
+}
+
+function videoTokenForRelease(metadata: TechnicalMetadata): string {
+  const encoder = (metadata.videoEncode ?? '').replace(/[. _-]/g, '').toUpperCase()
+  if (metadata.releaseType === 'ENCODE' || metadata.releaseType === 'WEBRip') {
+    if (encoder === 'X264') return 'x264'
+    if (encoder === 'X265') return 'x265'
+    if (encoder === 'AV1') return 'AV1'
+  }
+  const codec = (metadata.videoCodec || metadata.videoEncode || '').replace(/[. _-]/g, '').toUpperCase()
+  if (codec === 'AVC' || codec === 'H264' || codec === 'X264') return metadata.releaseType === 'REMUX' ? 'AVC' : 'H.264'
+  if (codec === 'HEVC' || codec === 'H265' || codec === 'X265') return metadata.releaseType === 'REMUX' ? 'HEVC' : 'H.265'
+  if (codec === 'VC1') return 'VC-1'
+  return metadata.videoCodec || metadata.videoEncode || ''
 }
 
 export function formatReleaseName(metadata: TechnicalMetadata, settings: AppSettings): string {
@@ -111,25 +161,31 @@ export function formatReleaseName(metadata: TechnicalMetadata, settings: AppSett
 
   switch (metadata.releaseType) {
     case 'WEB-DL':
+      add(metadata.service)
+      add(metadata.releaseType)
+      add(metadata.audio)
+      add(metadata.hdr)
+      add(videoTokenForRelease(metadata))
+      break
     case 'WEBRip':
       add(metadata.service)
       add(metadata.releaseType)
       add(metadata.audio)
       add(metadata.hdr)
-      add(metadata.videoCodec)
+      add(videoTokenForRelease(metadata))
       break
     case 'REMUX':
       add(metadata.source)
       add('REMUX')
       add(metadata.hdr)
-      add(metadata.videoCodec)
+      add(videoTokenForRelease(metadata))
       add(metadata.audio)
       break
     case 'ENCODE':
       add(metadata.source)
       add(metadata.audio)
       add(metadata.hdr)
-      add(metadata.videoCodec)
+      add(videoTokenForRelease(metadata))
       break
   }
 
@@ -169,12 +225,13 @@ function syntheticPlan(request: RenameRequest, scan: ScanResult | null): RenameP
       const oldName = basename(file.path)
       const ext = extension(oldName)
       const isFolder = file.path === rootPath && file.kind === 'other'
-      const targetName = isFolder ? release : `${release}${ext}`
+      const preserved = request.preserveExistingP2P && isP2PReleaseName(oldName)
+      const targetName = preserved ? oldName : isFolder ? release : `${release}${ext}`
       return {
         oldPath: file.path,
         newPath: `${parentPath(file.path)}${file.path.includes('\\') ? '\\' : '/'}${targetName}`,
         kind: isFolder ? 'folder' as const : 'file' as const,
-        status: oldName === targetName ? 'same' as const : 'ready' as const,
+        status: preserved ? 'preserved' as const : oldName === targetName ? 'same' as const : 'ready' as const,
       }
     })
   if (!items.length) {
@@ -185,9 +242,12 @@ function syntheticPlan(request: RenameRequest, scan: ScanResult | null): RenameP
       status: 'ready',
     })
   }
+  const changeCount = items.filter((item) => item.status === 'ready').length
   return {
     id: `preview-${Date.now()}`,
     items,
+    changeCount,
+    canApply: changeCount > 0,
     warnings: request.metadata.service ? [] : ['Service tag was not found in the original filename and was omitted.'],
     errors: [],
   }
@@ -197,12 +257,11 @@ function normalizeRenamePlan(value: RenamePlan | null | undefined): RenamePlan {
   if (!value || typeof value.id !== 'string') {
     throw new Error('The backend returned an invalid rename plan.')
   }
-  return {
-    ...value,
-    items: Array.isArray(value.items) ? value.items : [],
-    warnings: Array.isArray(value.warnings) ? value.warnings : [],
-    errors: Array.isArray(value.errors) ? value.errors : [],
-  }
+  const items = Array.isArray(value.items) ? value.items : []
+  const warnings = Array.isArray(value.warnings) ? value.warnings : []
+  const errors = Array.isArray(value.errors) ? value.errors : []
+  const changeCount = Number.isFinite(value.changeCount) ? value.changeCount : items.filter((item) => item.status === 'ready').length
+  return { ...value, items, warnings, errors, changeCount, canApply: typeof value.canApply === 'boolean' ? value.canApply : changeCount > 0 && errors.length === 0 }
 }
 
 export interface RenamerState {
@@ -254,11 +313,13 @@ export function useRenamer(): RenamerState {
 
   const updateMetadata = useCallback((patch: Partial<TechnicalMetadata>) => {
     setMetadata((current) => ({ ...current, ...patch }))
+    setPlan(null)
     setApplied(false)
   }, [])
 
   const updateSettings = useCallback((patch: Partial<AppSettings>) => {
     setSettings((current) => ({ ...current, ...patch }))
+    setPlan(null)
     setApplied(false)
   }, [])
 
@@ -270,7 +331,15 @@ export function useRenamer(): RenamerState {
     try {
       const result = await bridge.ScanPath(path)
       setScan(result)
-      setMetadata((current) => ({ ...current, ...result.metadata, mediaType: result.mediaType, uhd: result.metadata.uhd === true }))
+      setMetadata((current) => ({
+        ...current,
+        ...result.metadata,
+        mediaType: result.mediaType || result.metadata.mediaType || 'movie',
+        videoEncode: result.metadata.videoEncode ?? '',
+        uhd: result.metadata.uhd === true,
+      }))
+      setPlan(null)
+      setApplied(false)
       const warningCount = result.warnings?.length ?? 0
       setNotice(`Scanned ${result.files.length} item${result.files.length === 1 ? '' : 's'}${warningCount ? ` with ${warningCount} warning${warningCount === 1 ? '' : 's'}` : ''}.`)
     } catch (cause) {
@@ -281,7 +350,9 @@ export function useRenamer(): RenamerState {
         // path), since that could lead to an unsafe rename plan.
         const result = syntheticScan(path)
         setScan(result)
-        setMetadata((current) => ({ ...current, ...result.metadata, uhd: result.metadata.uhd === true }))
+        setMetadata((current) => ({ ...current, ...result.metadata, videoEncode: result.metadata.videoEncode ?? '', uhd: result.metadata.uhd === true }))
+        setPlan(null)
+        setApplied(false)
         setNotice('Browser preview: showing a synthetic MediaInfo result.')
       } else {
         setError(cause instanceof Error ? cause.message : 'Could not scan this path.')
@@ -324,6 +395,7 @@ export function useRenamer(): RenamerState {
     rootPath: selectedPath,
     metadata: { ...metadata, group: metadata.group || settings.group },
     separator: settings.separator,
+    preserveExistingP2P: settings.preserveExistingP2P,
   }), [metadata, selectedPath, settings])
 
   const preview = useCallback(async () => {
@@ -334,9 +406,17 @@ export function useRenamer(): RenamerState {
       // Older Wails responses may omit empty slices. Normalize at the bridge
       // boundary so rendering a successful plan can never dereference an
       // undefined items/warnings/errors collection.
-      setPlan(normalizeRenamePlan(next))
+      const normalized = normalizeRenamePlan(next)
+      setPlan(normalized)
       setApplied(false)
-      setNotice('Preview refreshed.')
+      const hasPreserved = normalized.items.some((item) => item.status === 'preserved')
+      setNotice(normalized.errors.length
+        ? 'Preview built with errors; resolve them before applying.'
+        : normalized.canApply
+          ? 'Preview refreshed.'
+          : hasPreserved
+            ? 'Existing P2P names were preserved; nothing needs to be applied.'
+            : 'The selected paths already match the target names.')
     } catch (cause) {
       if (isBridgeError(cause)) {
         setPlan(syntheticPlan(request, scan))
@@ -357,6 +437,14 @@ export function useRenamer(): RenamerState {
 
   const apply = useCallback(async () => {
     if (!plan) return
+    if (plan.errors.length) {
+      setNotice('Resolve the plan errors before applying.')
+      return
+    }
+    if (!plan.canApply) {
+      setNotice('Nothing to rename.')
+      return
+    }
     setBusy(true)
     setError('')
     try {

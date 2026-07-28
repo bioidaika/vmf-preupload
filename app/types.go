@@ -18,12 +18,14 @@ type TechnicalMetadata struct {
 	Service       string `json:"service"`
 	ReleaseType   string `json:"releaseType"`
 	VideoCodec    string `json:"videoCodec"`
-	VideoEncode   string `json:"videoEncode,omitempty"`
-	HDR           string `json:"hdr"`
-	Audio         string `json:"audio"`
-	Languages     string `json:"languages"`
-	Group         string `json:"group"`
-	UHD           bool   `json:"uhd"`
+	// Always cross the Wails boundary, including as an empty string, so a new
+	// scan cannot inherit encoder proof from the previously selected file.
+	VideoEncode string `json:"videoEncode"`
+	HDR         string `json:"hdr"`
+	Audio       string `json:"audio"`
+	Languages   string `json:"languages"`
+	Group       string `json:"group"`
+	UHD         bool   `json:"uhd"`
 }
 
 type ScanFile struct {
@@ -53,8 +55,10 @@ type RenameItem struct {
 }
 
 type RenamePlan struct {
-	ID    string       `json:"id"`
-	Items []RenameItem `json:"items"`
+	ID          string       `json:"id"`
+	Items       []RenameItem `json:"items"`
+	ChangeCount int          `json:"changeCount"`
+	CanApply    bool         `json:"canApply"`
 	// Keep empty collections in the Wails response. The frontend renders these
 	// fields immediately after a plan is built, so omitting an empty slice would
 	// turn it into undefined in JavaScript.
@@ -66,14 +70,17 @@ type RenameRequest struct {
 	RootPath  string            `json:"rootPath"`
 	Metadata  TechnicalMetadata `json:"metadata"`
 	Separator string            `json:"separator"`
+	// A pointer keeps old clients safe: an omitted value defaults to true.
+	PreserveExistingP2P *bool `json:"preserveExistingP2P,omitempty"`
 	// IncludeUHD is accepted for vmf@1 client compatibility but deliberately
 	// ignored; only an explicit marker in the original filename enables UHD.
 	IncludeUHD bool `json:"includeUhd,omitempty"`
 }
 
 type Settings struct {
-	Separator string `json:"separator"`
-	Group     string `json:"group"`
+	Separator           string `json:"separator"`
+	Group               string `json:"group"`
+	PreserveExistingP2P *bool  `json:"preserveExistingP2P,omitempty"`
 	// IncludeUHD is a deprecated compatibility field and is not honored.
 	IncludeUHD   bool   `json:"includeUhd,omitempty"`
 	Profile      string `json:"profile"`

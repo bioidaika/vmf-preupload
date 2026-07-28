@@ -15,9 +15,10 @@ const currentProfile = "vmf@2"
 
 func DefaultSettings() api.Settings {
 	return api.Settings{
-		ReleaseGroup: "NoGroup",
-		Separator:    ".",
-		Profile:      currentProfile,
+		ReleaseGroup:        "NoGroup",
+		Separator:           ".",
+		PreserveExistingP2P: true,
+		Profile:             currentProfile,
 	}
 }
 

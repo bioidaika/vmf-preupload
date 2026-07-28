@@ -16,6 +16,8 @@ export interface TechnicalMetadata {
   service: string
   releaseType: ReleaseType
   videoCodec: string
+  /** Encoder library when MediaInfo proves it (for example x264/x265). */
+  videoEncode?: string
   hdr: string
   audio: string
   languages: string
@@ -44,12 +46,14 @@ export interface RenameItem {
   oldPath: string
   newPath: string
   kind: 'file' | 'folder'
-  status?: 'ready' | 'same' | 'conflict' | 'warning'
+  status?: 'ready' | 'same' | 'preserved' | 'conflict' | 'warning'
 }
 
 export interface RenamePlan {
   id: string
   items: RenameItem[]
+  changeCount: number
+  canApply: boolean
   warnings: string[]
   errors: string[]
 }
@@ -58,6 +62,7 @@ export interface RenameRequest {
   rootPath: string
   metadata: TechnicalMetadata
   separator: string
+  preserveExistingP2P: boolean
   /** Deprecated vmf@1 compatibility field; the backend ignores it. */
   includeUhd?: boolean
 }
@@ -74,6 +79,7 @@ export interface SearchResult {
 export interface AppSettings {
   separator: string
   group: string
+  preserveExistingP2P: boolean
   /** Deprecated vmf@1 compatibility field; ignored. */
   includeUhd?: boolean
   profile: string
@@ -107,6 +113,7 @@ export const defaultMetadata: TechnicalMetadata = {
 export const defaultSettings: AppSettings = {
   separator: '.',
   group: 'NoGroup',
+  preserveExistingP2P: true,
   profile: 'vmf@2',
   tmdbApiKey: '',
   tvdbApiKey: '',

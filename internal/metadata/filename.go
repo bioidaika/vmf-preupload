@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	seasonEpisodePattern = regexp.MustCompile(`(?i)(?:^|[. _-])S(\d{1,2})(?:E(\d{1,3}))?(?:E(\d{1,3}))?`) // S01, S01E02, S01E02E03
+	seasonEpisodePattern = regexp.MustCompile(`(?i)(?:^|[. _-])S(\d{1,2})(?:E(\d{1,3}))?(?:E(\d{1,3}))?(?:$|[. _-])`) // S01, S01E02, S01E02E03
 	yearPattern          = regexp.MustCompile(`(?:^|[. _()\[\]-])((?:19|20)\d{2})(?:$|[. _()\[\]-])`)
 	// Keep this list deliberately bounded and token-delimited.  A generic
 	// "word after the resolution" heuristic would mistake title words such as
@@ -21,6 +21,10 @@ var (
 	// being swallowed as one giant group.
 	groupPattern = regexp.MustCompile(`-([A-Za-z0-9][A-Za-z0-9_]*)$`)
 	uhdPattern   = regexp.MustCompile(`(?i)(?:^|[. _-])(?:UHD|ULTRA[. _-]+HD)(?:$|[. _-])`)
+	// The first technical token after SxxEyy terminates an optional episode
+	// title. Keep the list token-delimited so ordinary title words are not
+	// stripped merely because they contain a codec or source substring.
+	technicalMarkerPattern = regexp.MustCompile(`(?i)(?:^|[. _-])(?:8k|4k|4320p|2160p|1440p|1080[pi]|720p|576[pi]|480[pi]|web[. _-]*dl|web[. _-]*rip|remux|blu[. _-]*ray|hdtv|uhd|ultra[. _-]+hd|hdr10\+?|hdr|dolby[. _-]+vision|dv|x26[45]|h[. _-]?26[45]|hevc|avc|av1|vp9|dts(?:[. _-]*hd(?:[. _-]*(?:ma|hra))?)?|truehd|e[. _-]*ac[. _-]*3|ac[. _-]*3|(?:ddp|dd\+?|aac)[. _-]?\d+(?:\.\d+){1,2}(?:[. _-]*atmos)?|ddp|dd\+|aac|flac|lpcm|pcm|mp[23])(?:[. _-]|$)`)
 )
 
 // ParseFilename extracts hints only. It never treats a hint as authoritative;
@@ -33,6 +37,18 @@ func ParseFilename(filename string) api.ContentInfo {
 		info.Category = "TV"
 		info.Season = match[1]
 		info.Episode = match[2]
+		if match[3] != "" {
+			info.Episode = "E" + match[2] + "E" + match[3]
+		}
+		if location := seasonEpisodePattern.FindStringIndex(base); location != nil {
+			// The match includes its leading delimiter. Everything before it is
+			// the series title; text after it and before the technical suffix is
+			// an episode title such as "Pilot".
+			info.Title = titleHint(base[:location[0]])
+			if info.Episode != "" {
+				info.EpisodeTitle = episodeTitleHint(base[location[1]:])
+			}
+		}
 	}
 	if match := yearPattern.FindStringSubmatch(base); match != nil {
 		info.Year = match[1]
@@ -52,7 +68,9 @@ func ParseFilename(filename string) api.ContentInfo {
 	}
 	// Remove technical suffixes to produce a conservative title hint. The UI
 	// and provider search remain authoritative for the final title.
-	info.Title = titleHint(base)
+	if info.Title == "" {
+		info.Title = titleHint(base)
+	}
 	return info
 }
 
@@ -115,7 +133,7 @@ func detectReleaseTypeAndSource(lower string) (string, string) {
 
 func isStructuralToken(value string) bool {
 	lower := strings.ToLower(value)
-	for _, token := range []string{"web-dl", "webdl", "webrip", "remux", "x264", "x265", "h264", "h265", "nogroup", "nogrp", "unknown"} {
+	for _, token := range []string{"web-dl", "webdl", "webrip", "remux", "x264", "x265", "h264", "h265", "dl", "hd", "hdr", "dv", "nogroup", "nogrp", "unknown", "unk"} {
 		if lower == token {
 			return true
 		}
@@ -137,9 +155,25 @@ func titleHint(base string) string {
 	value = uhdPattern.ReplaceAllString(value, " ")
 	// Stop at the first obvious technical marker. This deliberately leaves
 	// ambiguous text for the provider search instead of silently discarding it.
-	markers := regexp.MustCompile(`(?i)[. _-](2160p|1080p|720p|4320p|web-dl|webdl|webrip|remux|bluray|hdtv|uhd|ultra[. _-]+hd|x264|x265|h\.264|h\.265|hevc|avc)(?:[. _-]|$)`)
-	if loc := markers.FindStringIndex(value); loc != nil {
+	if loc := technicalMarkerPattern.FindStringIndex(value); loc != nil {
 		value = value[:loc[0]]
+	}
+	value = strings.NewReplacer(".", " ", "_", " ", "-", " ").Replace(value)
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func episodeTitleHint(value string) string {
+	if match := groupPattern.FindStringSubmatch(value); match != nil && hasReleaseGroupEvidence(value[:matchStart(value, match[0])]) {
+		value = value[:matchStart(value, match[0])]
+	}
+	markerStart := len(value)
+	for _, pattern := range []*regexp.Regexp{technicalMarkerPattern, servicePattern} {
+		if loc := pattern.FindStringIndex(value); loc != nil && loc[0] < markerStart {
+			markerStart = loc[0]
+		}
+	}
+	if markerStart < len(value) {
+		value = value[:markerStart]
 	}
 	value = strings.NewReplacer(".", " ", "_", " ", "-", " ").Replace(value)
 	return strings.Join(strings.Fields(value), " ")

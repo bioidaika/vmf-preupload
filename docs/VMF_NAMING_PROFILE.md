@@ -14,6 +14,9 @@ invent a service, source, edition, or release group from a codec alone.
   MediaInfo, a parent-folder name, or a legacy force flag.
 - service: optional; retain only when found in the old name or entered by the
   user
+- existing P2P: preserve the basename exactly by default when a real group,
+  identity, resolution, and release signature are all present. This protection
+  is evaluated per file and can be disabled to force VMF rendering.
 
 ## Token order
 
@@ -34,11 +37,18 @@ MediaInfo `MPEG Audio` is resolved with `Format_Profile` and `CodecID`: Layer 2
 becomes `MP2`, Layer 3 becomes `MP3`, and the channel token remains separate
 (`MP2.2.0`/`MP3.2.0`). An unknown MPEG layer is never guessed.
 
+Video spelling follows the release mode:
+
+- REMUX uses bitstream names (`AVC` / `HEVC`);
+- WEB-DL uses delivery codec names (`H.264` / `H.265`);
+- ENCODE and WEBRip use `x264` / `x265` only when MediaInfo identifies that
+  encoder library; otherwise they retain the codec name and do not guess.
+
 Examples:
 
 ```text
 Example.Movie.2026.ViE.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.H.265-NoGroup.mkv
-Example.Movie.2026.2160p.UHD.BluRay.REMUX.HDR.H.265.TrueHD.7.1-NoGroup.mkv
+Example.Movie.2026.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1-NoGroup.mkv
 Example.Show.2026.S01E02.ViE.1080p.WEBRip.DDP5.1.x264-NoGroup.mkv
 ```
 

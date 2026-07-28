@@ -438,3 +438,313 @@ func TestScanPathPropagatesMediaInfoWarnings(t *testing.T) {
 		t.Fatalf("unexpected warnings: %#v", result.Warnings)
 	}
 }
+
+func TestPreviewPreservesExistingP2PGothamExactly(t *testing.T) {
+	root := t.TempDir()
+	originalName := "Gotham.S01E01.Pilot.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.mkv"
+	originalPath := filepath.Join(root, originalName)
+	if err := os.WriteFile(originalPath, []byte("synthetic-media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	application := NewApp()
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: originalPath,
+		Metadata: TechnicalMetadata{
+			MediaType:    "tv",
+			Title:        "Gotham",
+			Year:         "2014",
+			Season:       "1",
+			Episode:      "1",
+			EpisodeTitle: "Pilot",
+			Resolution:   "1080p",
+			ReleaseType:  "REMUX",
+			VideoCodec:   "H.264",
+			Audio:        "DTS-HD.MA.5.1",
+			Group:        "NoGroup",
+		},
+		Separator:           ".",
+		PreserveExistingP2P: testBoolPointer(true),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if len(plan.Items) != 1 {
+		t.Fatalf("items=%d want=1: %#v", len(plan.Items), plan.Items)
+	}
+	item := plan.Items[0]
+	if item.Status != "preserved" {
+		t.Fatalf("status=%q want preserved: %#v", item.Status, item)
+	}
+	if item.OldPath != originalPath || item.NewPath != originalPath {
+		t.Fatalf("protected release must remain exact: %#v", item)
+	}
+	if filepath.Base(item.NewPath) != originalName {
+		t.Fatalf("basename=%q want exact %q", filepath.Base(item.NewPath), originalName)
+	}
+	if plan.ChangeCount != 0 || plan.CanApply {
+		t.Fatalf("no-op plan changeCount=%d canApply=%t", plan.ChangeCount, plan.CanApply)
+	}
+	if err := application.ApplyRename(plan); err == nil || !strings.Contains(strings.ToLower(err.Error()), "nothing to rename") {
+		t.Fatalf("ApplyRename error=%v want nothing-to-rename", err)
+	}
+	if application.journal != nil {
+		t.Fatalf("no-op apply must not create a journal: %#v", application.journal)
+	}
+	if _, err := os.Stat(originalPath); err != nil {
+		t.Fatalf("preserved source disappeared: %v", err)
+	}
+}
+
+func TestPreviewCanForceVMFRenderForExistingP2P(t *testing.T) {
+	root := t.TempDir()
+	originalName := "Gotham.S01E01.Pilot.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.mkv"
+	originalPath := filepath.Join(root, originalName)
+	if err := os.WriteFile(originalPath, []byte("synthetic-media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	application := NewApp()
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: originalPath,
+		Metadata: TechnicalMetadata{
+			MediaType:    "tv",
+			Title:        "Gotham",
+			Year:         "2014",
+			Season:       "1",
+			Episode:      "1",
+			EpisodeTitle: "Pilot",
+			Resolution:   "1080p",
+			ReleaseType:  "REMUX",
+			VideoCodec:   "H.264",
+			Audio:        "DTS-HD.MA.5.1",
+			Group:        "NoGroup",
+		},
+		Separator:           ".",
+		PreserveExistingP2P: testBoolPointer(false),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if len(plan.Items) != 1 {
+		t.Fatalf("items=%d want=1: %#v", len(plan.Items), plan.Items)
+	}
+	item := plan.Items[0]
+	if item.Status != "ready" {
+		t.Fatalf("status=%q want ready: %#v", item.Status, item)
+	}
+	want := "Gotham.2014.S01E01.Pilot.1080p.REMUX.AVC.DTS-HD.MA.5.1-NoGroup.mkv"
+	if got := filepath.Base(item.NewPath); got != want {
+		t.Fatalf("forced VMF basename=%q want %q", got, want)
+	}
+	if item.NewPath == originalPath {
+		t.Fatalf("preserve=false unexpectedly kept the source name: %#v", item)
+	}
+	if plan.ChangeCount != 1 || !plan.CanApply {
+		t.Fatalf("forced plan changeCount=%d canApply=%t", plan.ChangeCount, plan.CanApply)
+	}
+}
+
+func TestPreviewGenericFolderCarriesProtectedChildAtRelativeSeasonPath(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "incoming")
+	seasonDir := filepath.Join(root, "Season 1")
+	if err := os.MkdirAll(seasonDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	originalName := "Gotham.S01E01.Pilot.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.mkv"
+	originalPath := filepath.Join(seasonDir, originalName)
+	if err := os.WriteFile(originalPath, []byte("synthetic-media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	application := NewApp()
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: root,
+		Metadata: TechnicalMetadata{
+			MediaType:    "tv",
+			Title:        "Gotham",
+			Year:         "2014",
+			Season:       "1",
+			Episode:      "1",
+			EpisodeTitle: "Pilot",
+			Resolution:   "1080p",
+			ReleaseType:  "REMUX",
+			VideoCodec:   "H.264",
+			Audio:        "DTS-HD.MA.5.1",
+			Group:        "NoGroup",
+		},
+		Separator:           ".",
+		PreserveExistingP2P: testBoolPointer(true),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if plan.ChangeCount != 1 || !plan.CanApply {
+		t.Fatalf("folder-only plan changeCount=%d canApply=%t items=%#v", plan.ChangeCount, plan.CanApply, plan.Items)
+	}
+
+	var folderItem, protectedItem *RenameItem
+	for index := range plan.Items {
+		item := &plan.Items[index]
+		switch {
+		case item.Kind == "folder" && item.Status == "ready":
+			folderItem = item
+		case item.Kind == "file" && item.Status == "preserved":
+			protectedItem = item
+		}
+	}
+	if folderItem == nil || protectedItem == nil {
+		t.Fatalf("want one folder rename and one protected child: %#v", plan.Items)
+	}
+	wantChildPath := filepath.Join(folderItem.NewPath, "Season 1", originalName)
+	if protectedItem.OldPath != originalPath || protectedItem.NewPath != wantChildPath {
+		t.Fatalf("protected child relative path changed: got %#v want destination %q", protectedItem, wantChildPath)
+	}
+	if err := application.ApplyRename(plan); err != nil {
+		t.Fatalf("ApplyRename: %v", err)
+	}
+	if _, err := os.Stat(wantChildPath); err != nil {
+		t.Fatalf("protected child missing after parent rename: %v", err)
+	}
+}
+
+func TestPreviewMixedFolderPreservesP2PAndRendersRawEpisode(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "incoming")
+	seasonDir := filepath.Join(root, "Season 1")
+	if err := os.MkdirAll(seasonDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	protectedName := "Gotham.S01E01.Pilot.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.mkv"
+	protectedPath := filepath.Join(seasonDir, protectedName)
+	rawPath := filepath.Join(seasonDir, "Gotham.S01E02.mkv")
+	for _, path := range []string{protectedPath, rawPath} {
+		if err := os.WriteFile(path, []byte("synthetic-media"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	application := NewApp()
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: root,
+		Metadata: TechnicalMetadata{
+			MediaType:   "tv",
+			Title:       "Gotham",
+			Year:        "2014",
+			Season:      "1",
+			Resolution:  "1080p",
+			ReleaseType: "REMUX",
+			VideoCodec:  "H.264",
+			Audio:       "DTS-HD.MA.5.1",
+			Group:       "NoGroup",
+		},
+		Separator:           ".",
+		PreserveExistingP2P: testBoolPointer(true),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if plan.ChangeCount != 2 || !plan.CanApply {
+		t.Fatalf("mixed plan changeCount=%d canApply=%t items=%#v", plan.ChangeCount, plan.CanApply, plan.Items)
+	}
+
+	foundProtected, foundRawReady := false, false
+	for _, item := range plan.Items {
+		switch item.OldPath {
+		case protectedPath:
+			foundProtected = item.Status == "preserved" && filepath.Base(item.NewPath) == protectedName && filepath.Base(filepath.Dir(item.NewPath)) == "Season 1"
+		case rawPath:
+			foundRawReady = item.Status == "ready" && strings.Contains(filepath.Base(item.NewPath), ".S01E02.")
+		}
+	}
+	if !foundProtected || !foundRawReady {
+		t.Fatalf("preservation leaked or raw episode was not rendered: %#v", plan.Items)
+	}
+}
+
+func TestPreviewBlocksPartialPlanWhenDestinationsCollide(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "incoming")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"raw-a.mkv", "raw-b.mkv"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := NewApp()
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: root,
+		Metadata: TechnicalMetadata{
+			MediaType: "movie", Title: "Example Movie", Year: "2024", Resolution: "1080p",
+			ReleaseType: "WEB-DL", VideoCodec: "H.264", Group: "NoGroup",
+		},
+		Separator:           ".",
+		PreserveExistingP2P: testBoolPointer(true),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if len(plan.Errors) == 0 || plan.CanApply {
+		t.Fatalf("collision must block the complete plan: %#v", plan)
+	}
+	foundConflict := false
+	for _, item := range plan.Items {
+		if item.Status == "conflict" {
+			foundConflict = true
+		}
+	}
+	if !foundConflict {
+		t.Fatalf("collision is not visible in preview items: %#v", plan.Items)
+	}
+	if err := application.ApplyRename(plan); err == nil || !strings.Contains(strings.ToLower(err.Error()), "unresolved") {
+		t.Fatalf("backend must reject a partial collision plan: %v", err)
+	}
+	for _, name := range []string{"raw-a.mkv", "raw-b.mkv"} {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("collision rejection changed %s: %v", name, err)
+		}
+	}
+}
+
+func TestScanDoesNotAdoptDetectedThirdPartyGroupForRendering(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "Gotham.S01E01.Pilot.1080p.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.mkv")
+	if err := os.WriteFile(path, []byte("synthetic-media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	application := NewApp()
+	application.settings.ReleaseGroup = "NoGroup"
+	result, err := application.ScanPath(path)
+	if err != nil {
+		t.Fatalf("ScanPath: %v", err)
+	}
+	if result.Metadata.Group != "NoGroup" {
+		t.Fatalf("detected third-party group leaked into output metadata: %#v", result.Metadata)
+	}
+	if result.MediaType != "tv" || result.Metadata.MediaType != "tv" {
+		t.Fatalf("TV category did not cross both scan DTO fields: %#v", result)
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"videoEncode":""`) {
+		t.Fatalf("empty encoder proof must be explicit in scan JSON: %s", data)
+	}
+}
+
+func TestSettingsDTOOmissionKeepsPreservationSafeDefault(t *testing.T) {
+	if got := settingsFromDTO(Settings{}); !got.PreserveExistingP2P {
+		t.Fatal("an older client omitting preserveExistingP2P must retain the safe default")
+	}
+	value := false
+	if got := settingsFromDTO(Settings{PreserveExistingP2P: &value}); got.PreserveExistingP2P {
+		t.Fatal("an explicit false preserveExistingP2P setting must be honored")
+	}
+}
+
+func testBoolPointer(value bool) *bool {
+	return &value
+}

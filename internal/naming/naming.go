@@ -158,13 +158,15 @@ type Metadata struct {
 }
 
 var (
-	invalidFilenameRune = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
-	multiDots           = regexp.MustCompile(`\.{2,}`)
-	spaceLike           = regexp.MustCompile(`[\s_]+`)
-	vmfExistingTag      = regexp.MustCompile(`(?i)(?:^|[. _-])vie(?:[. _-]dub)?(?:$|[. _-])`)
-	vmfExistingDub      = regexp.MustCompile(`(?i)(?:^|[. _-])vie[. _-]dub(?:$|[. _-])`)
-	wordTM              = regexp.MustCompile(`(?i)(^|[^[:alnum:]])tm([^[:alnum:]]|$)`)
-	compactAudioPrefix  = regexp.MustCompile(`(?i)^(DDP|DD\+|DD|AAC)\.(\d+(?:\.\d+)?)(.*)$`)
+	invalidFilenameRune  = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
+	multiDots            = regexp.MustCompile(`\.{2,}`)
+	spaceLike            = regexp.MustCompile(`[\s_]+`)
+	vmfExistingTag       = regexp.MustCompile(`(?i)(?:^|[. _-])vie(?:[. _-]dub)?(?:$|[. _-])`)
+	vmfExistingDub       = regexp.MustCompile(`(?i)(?:^|[. _-])vie[. _-]dub(?:$|[. _-])`)
+	wordTM               = regexp.MustCompile(`(?i)(^|[^[:alnum:]])tm([^[:alnum:]]|$)`)
+	compactAudioPrefix   = regexp.MustCompile(`(?i)^(DDP|DD\+|DD|AAC)\.(\d+(?:\.\d+)?)(.*)$`)
+	audioChannelNotation = regexp.MustCompile(`(?:^|[^0-9])(\d{1,2})\.(\d{1,2})(?:\.(\d{1,2}))?(?:$|[^0-9])`)
+	audioChannelCount    = regexp.MustCompile(`^\s*(\d{1,2})(?:\s|channels?|ch)?\s*$`)
 )
 
 // Render builds a deterministic basename (without an extension) and returns
@@ -254,10 +256,8 @@ func Render(m Metadata, profile Profile) (string, []Warning) {
 
 	audio := renderAudio(m)
 	hdr := normalizePart(m.HDR)
-	videoCodec := normalizePart(firstNonEmpty(m.VideoCodec, m.Video))
-	videoEncode := normalizePart(firstNonEmpty(m.VideoEncode, m.Video))
-	videoForWebEncode := firstNonEmpty(videoEncode, videoCodec)
-	videoForRemux := firstNonEmpty(videoCodec, videoEncode)
+	videoCodec := firstNonEmpty(m.VideoCodec, m.Video)
+	videoEncode := firstNonEmpty(m.VideoEncode, m.Video)
 
 	switch typeValue {
 	case WebDL:
@@ -267,18 +267,18 @@ func Render(m Metadata, profile Profile) (string, []Warning) {
 		add("WEB-DL")
 		add(audio)
 		add(hdr)
-		add(videoForWebEncode)
+		add(videoTokenForRelease(WebDL, videoCodec, videoEncode))
 	case WebRip:
 		add(service)
 		add("WEBRip")
 		add(audio)
 		add(hdr)
-		add(videoForWebEncode)
+		add(videoTokenForRelease(WebRip, videoCodec, videoEncode))
 	case Remux:
 		add(source)
 		add("REMUX")
 		add(hdr)
-		add(videoForRemux)
+		add(videoTokenForRelease(Remux, videoCodec, videoEncode))
 		add(audio)
 	case Encode:
 		add(source)
@@ -286,7 +286,7 @@ func Render(m Metadata, profile Profile) (string, []Warning) {
 		// rather than an extra literal ENCODE component.
 		add(audio)
 		add(hdr)
-		add(videoForWebEncode)
+		add(videoTokenForRelease(Encode, videoCodec, videoEncode))
 	default:
 		// Keep unknown/omitted types useful without inventing a source or
 		// service.  If a caller supplied an unrecognized type, preserve it as
@@ -296,7 +296,7 @@ func Render(m Metadata, profile Profile) (string, []Warning) {
 		add(service)
 		add(audio)
 		add(hdr)
-		add(videoForWebEncode)
+		add(firstNonEmpty(videoEncode, videoCodec))
 	}
 
 	group := normalizeGroup(firstNonEmpty(m.Group, m.GroupTag), p.DefaultGroup)
@@ -430,6 +430,48 @@ func inferReleaseType(source, service, existing string) string {
 	return ""
 }
 
+// videoTokenForRelease applies the codec spelling convention associated with
+// the release type. AVC/HEVC describe the untouched bitstream in a REMUX,
+// x264/x265 identify an encode (including WEBRip), while WEB-DL uses the
+// H.264/H.265 delivery spelling. The input facts may use any equivalent alias.
+func videoTokenForRelease(releaseType, codec, encode string) string {
+	if releaseType == Encode || releaseType == WebRip {
+		encoder := strings.ToUpper(strings.NewReplacer(" ", "", ".", "", "-", "", "_", "").Replace(strings.TrimSpace(encode)))
+		switch encoder {
+		case "X264":
+			return "x264"
+		case "X265":
+			return "x265"
+		case "AV1":
+			return "AV1"
+		}
+	}
+	value := firstNonEmpty(codec, encode)
+	compact := strings.ToUpper(strings.NewReplacer(" ", "", ".", "", "-", "", "_", "").Replace(strings.TrimSpace(value)))
+	switch compact {
+	case "AVC", "H264", "X264":
+		if releaseType == Remux {
+			return "AVC"
+		}
+		return "H.264"
+	case "HEVC", "H265", "X265":
+		if releaseType == Remux {
+			return "HEVC"
+		}
+		return "H.265"
+	case "AV1":
+		return "AV1"
+	case "VP9":
+		return "VP9"
+	case "VC1":
+		return "VC-1"
+	case "MPEG2", "MPEGVIDEO":
+		return "MPEG-2"
+	default:
+		return normalizePart(value)
+	}
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -558,14 +600,13 @@ func renderAudio(m Metadata) string {
 
 	track := chooseAudioTrack(m.AudioTracks)
 	codec := firstNonEmpty(m.AudioCodec, track.Codec, track.Format)
-	channels := firstNonEmpty(m.AudioChannels, track.Channels, track.ChannelLayout)
+	channels := normalizeAudioChannels(firstNonEmpty(m.AudioChannels, track.Channels, track.ChannelLayout))
 	atmos := m.AudioAtmos || track.Atmos || containsAtmos(track.Title, codec)
 	if codec == "" && channels == "" && !atmos {
 		return ""
 	}
 
 	codec = normalizeAudioCodec(codec)
-	channels = normalizePart(channels)
 	parts := make([]string, 0, 3)
 	if codec != "" {
 		// Scene naming convention combines the short Dolby/AAC codec with
@@ -586,6 +627,57 @@ func renderAudio(m Metadata) string {
 		parts = append(parts, "Atmos")
 	}
 	return strings.Join(parts, ".")
+}
+
+func normalizeAudioChannels(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if match := audioChannelNotation.FindStringSubmatch(value); match != nil {
+		if match[3] != "" {
+			return match[1] + "." + match[2] + "." + match[3]
+		}
+		return match[1] + "." + match[2]
+	}
+	if match := audioChannelCount.FindStringSubmatch(value); match != nil {
+		count, _ := strconv.Atoi(match[1])
+		switch count {
+		case 1:
+			return "1.0"
+		case 2:
+			return "2.0"
+		case 6:
+			return "5.1"
+		case 8:
+			return "7.1"
+		default:
+			if count > 2 {
+				return strconv.Itoa(count) + ".0"
+			}
+		}
+	}
+
+	bed, lfe, height := 0, 0, 0
+	cleaned := strings.NewReplacer(",", " ", ":", " ", ";", " ", "/", " ").Replace(value)
+	for _, field := range strings.Fields(cleaned) {
+		switch strings.ToUpper(strings.Trim(field, "()[]{}")) {
+		case "LFE", "LFE1", "LFE2":
+			lfe++
+		case "TFL", "TFC", "TFR", "TBL", "TBC", "TBR", "TSL", "TSR", "VHL", "VHC", "VHR", "LH", "CH", "RH":
+			height++
+		case "L", "R", "C", "LS", "RS", "LB", "RB", "LC", "RC", "CS", "BC", "LW", "RW":
+			bed++
+		}
+	}
+	if bed == 0 && lfe == 0 && height == 0 {
+		// Unknown free-form layout text is never safe to emit as filename tags.
+		return ""
+	}
+	if height > 0 {
+		return strconv.Itoa(bed) + "." + strconv.Itoa(lfe) + "." + strconv.Itoa(height)
+	}
+	return strconv.Itoa(bed) + "." + strconv.Itoa(lfe)
 }
 
 func normalizeExplicitAudio(value string) string {

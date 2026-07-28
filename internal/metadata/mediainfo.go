@@ -78,9 +78,8 @@ func Extract(ctx context.Context, path, binary string) (api.TechnicalInfo, []str
 		info.Width = intValue(video, "Width", "width")
 		info.Height = intValue(video, "Height", "height")
 		info.Resolution = resolution(info.Width, info.Height, stringValue(video, "ScanType"))
-		format := stringValue(video, "Format", "CodecID")
-		info.VideoCodec = normalizeVideoCodec(format)
-		info.VideoEncode = detectEncode(video, info.VideoCodec)
+		info.VideoCodec = videoCodec(video)
+		info.VideoEncode = detectEncode(video)
 		info.HDR = detectHDR(video)
 	}
 	for index, track := range audio {
@@ -94,7 +93,7 @@ func Extract(ctx context.Context, path, binary string) (api.TechnicalInfo, []str
 			Default:  boolValue(track, "Default"),
 			Forced:   boolValue(track, "Forced"),
 		}
-		item.Atmos = strings.Contains(strings.ToLower(stringValue(track, "Format_AdditionalFeatures", "Title", "Format_Commercial")), "atmos") || strings.Contains(strings.ToLower(stringValue(track, "Format_Profile")), "joc")
+		item.Atmos = detectAudioAtmos(track)
 		item.Commentary = strings.Contains(strings.ToLower(item.Title), "commentary")
 		info.Tracks = append(info.Tracks, item)
 	}
@@ -174,15 +173,28 @@ func normalizeVideoCodec(value string) string {
 	}
 }
 
-func detectEncode(track map[string]any, codec string) string {
+func videoCodec(track map[string]any) string {
+	format := stringValue(track, "Format", "CodecID")
+	evidence := strings.ToUpper(strings.Join([]string{
+		format,
+		stringValue(track, "Format_Version"),
+		stringValue(track, "CodecID"),
+	}, " "))
+	if strings.Contains(evidence, "MPEG VIDEO") && (strings.Contains(evidence, "VERSION 2") || strings.Contains(evidence, "MPEG-2") || strings.Contains(evidence, "MPEG2")) {
+		return "MPEG-2"
+	}
+	return normalizeVideoCodec(format)
+}
+
+func detectEncode(track map[string]any) string {
 	library := strings.ToLower(stringValue(track, "Encoded_Library_Name", "Encoded_Library", "Encoded_Library_Settings"))
-	if strings.Contains(library, "x265") || strings.Contains(library, "hevc") {
+	if strings.Contains(library, "x265") {
 		return "x265"
 	}
-	if strings.Contains(library, "x264") || strings.Contains(library, "avc") {
+	if strings.Contains(library, "x264") {
 		return "x264"
 	}
-	return codec
+	return ""
 }
 
 func detectHDR(track map[string]any) string {
@@ -201,20 +213,24 @@ func detectHDR(track map[string]any) string {
 
 func normalizeAudioCodec(track map[string]any) string {
 	format := stringValue(track, "Format", "Format_String")
-	commercial := stringValue(track, "Format_Commercial", "Format_Commercial_IfAny")
-	profile := stringValue(track, "Format_Profile", "Format_Profile_String")
-	codecID := stringValue(track, "CodecID", "CodecID_Compatible")
+	commercial := strings.TrimSpace(strings.Join([]string{stringValue(track, "Format_Commercial"), stringValue(track, "Format_Commercial_IfAny")}, " "))
+	profile := strings.TrimSpace(strings.Join([]string{stringValue(track, "Format_Profile"), stringValue(track, "Format_Profile_String")}, " "))
+	codecID := strings.TrimSpace(strings.Join([]string{stringValue(track, "CodecID"), stringValue(track, "CodecID_Compatible")}, " "))
 	if codec := normalizeMPEGAudioCodec(format, commercial, profile, codecID); codec != "" {
 		return codec
 	}
-	value := strings.ToLower(format + " " + commercial)
+	value := strings.ToLower(strings.Join([]string{format, commercial, profile}, " "))
 	switch {
 	case strings.Contains(value, "truehd") || strings.Contains(value, "mlp fba"):
 		return "TrueHD"
 	case strings.Contains(value, "dts:x"):
 		return "DTS:X"
-	case strings.Contains(value, "dts-hd"):
+	case strings.Contains(value, "dts-hd") && (strings.Contains(value, "master audio") || regexp.MustCompile(`(?:^|[^a-z])ma(?:$|[^a-z])`).MatchString(value)):
 		return "DTS-HD.MA"
+	case strings.Contains(value, "dts-hd") && (strings.Contains(value, "high resolution") || regexp.MustCompile(`(?:^|[^a-z])hra(?:$|[^a-z])`).MatchString(value)):
+		return "DTS-HD.HRA"
+	case strings.Contains(value, "dts-hd"):
+		return "DTS-HD"
 	case strings.Contains(value, "dts"):
 		return "DTS"
 	case strings.Contains(value, "e-ac-3") || strings.Contains(value, "dolby digital plus"):
@@ -230,6 +246,21 @@ func normalizeAudioCodec(track map[string]any) string {
 	default:
 		return strings.TrimSpace(format)
 	}
+}
+
+func detectAudioAtmos(track map[string]any) bool {
+	evidence := strings.ToLower(strings.Join([]string{
+		stringValue(track, "Format_AdditionalFeatures"),
+		stringValue(track, "Title"),
+		stringValue(track, "Title_Original"),
+		stringValue(track, "Format_Commercial"),
+		stringValue(track, "Format_Commercial_IfAny"),
+		stringValue(track, "Format_Profile"),
+		stringValue(track, "Format_Profile_String"),
+	}, " "))
+	return strings.Contains(evidence, "atmos") ||
+		regexp.MustCompile(`(?:^|[^a-z0-9])joc(?:$|[^a-z0-9])`).MatchString(evidence) ||
+		regexp.MustCompile(`(?:^|[^a-z0-9])16[ -]?ch(?:$|[^a-z0-9])`).MatchString(evidence)
 }
 
 func normalizeMPEGAudioCodec(format, commercial, profile, codecID string) string {
@@ -256,23 +287,83 @@ func normalizeMPEGAudioCodec(format, commercial, profile, codecID string) string
 }
 
 func channels(track map[string]any) string {
-	value := stringValue(track, "ChannelLayout", "Channels_Original", "Channels")
+	// ChannelLayout is a list of speaker positions (for example
+	// "C L R Ls Rs LFE"), not a release-name channel token. Prefer the
+	// numeric MediaInfo fields and normalize the layout only as fallback
+	// evidence; raw speaker labels must never enter a release name.
+	value := stringValue(track, "Channels", "Channels_Original", "Channel_s_", "Channel_s__Original")
+	layout := stringValue(track, "ChannelLayout", "ChannelLayout_Original", "ChannelPositions", "ChannelPositions_Original")
 	if value == "" {
+		return channelLayoutNotation(layout)
+	}
+	if notation := channelNotation(value); notation != "" {
+		return notation
+	}
+	count := firstChannelCount(value)
+	if count == 0 {
 		return ""
 	}
-	if strings.Contains(value, "7.1") {
-		return "7.1"
+	if notation := channelLayoutNotation(layout); notation != "" {
+		return notation
 	}
-	if strings.Contains(value, "5.1") {
-		return "5.1"
-	}
-	if strings.Contains(value, "2.0") || value == "2" {
+	// MediaInfo commonly exposes only the total count. Its conventional
+	// multichannel values include one LFE channel, matching tracker notation.
+	switch count {
+	case 1:
+		return "1.0"
+	case 2:
 		return "2.0"
-	}
-	if value == "6" {
+	case 6:
 		return "5.1"
+	case 8:
+		return "7.1"
+	default:
+		return fmt.Sprintf("%d.0", count)
 	}
-	return value
+}
+
+func channelLayoutNotation(value string) string {
+	bed, lfe, height := 0, 0, 0
+	cleaned := strings.NewReplacer(",", " ", ":", " ", ";", " ", "/", " ").Replace(value)
+	for _, field := range strings.Fields(cleaned) {
+		switch strings.ToUpper(strings.Trim(field, "()[]{}")) {
+		case "LFE", "LFE1":
+			lfe++
+		case "LFE2":
+			lfe += 2
+		case "TFL", "TFC", "TFR", "TBL", "TBC", "TBR", "TSL", "TSR", "VHL", "VHC", "VHR", "LH", "CH", "RH":
+			height++
+		case "L", "R", "C", "LS", "RS", "LB", "RB", "LC", "RC", "CS", "BC", "LW", "RW":
+			bed++
+		}
+	}
+	if bed == 0 && lfe == 0 && height == 0 {
+		return ""
+	}
+	if height > 0 {
+		return fmt.Sprintf("%d.%d.%d", bed, lfe, height)
+	}
+	return fmt.Sprintf("%d.%d", bed, lfe)
+}
+
+func channelNotation(value string) string {
+	match := regexp.MustCompile(`(?:^|[^0-9])(\d{1,2})\.(\d{1,2})(?:\.(\d{1,2}))?(?:$|[^0-9])`).FindStringSubmatch(value)
+	if match == nil {
+		return ""
+	}
+	if match[3] != "" {
+		return match[1] + "." + match[2] + "." + match[3]
+	}
+	return match[1] + "." + match[2]
+}
+
+func firstChannelCount(value string) int {
+	match := regexp.MustCompile(`\d+`).FindString(value)
+	if match == "" {
+		return 0
+	}
+	count, _ := strconv.Atoi(match)
+	return count
 }
 
 func unique(values []string) []string {

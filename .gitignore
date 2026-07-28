@@ -2,6 +2,7 @@
 /build/*.exe
 /build/bin/
 /build/assets/
+/.codex-tmp/
 
 # Frontend dependencies and compiler output
 /frontend/node_modules/

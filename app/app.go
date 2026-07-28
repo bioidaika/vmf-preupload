@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/bioidaika/vmf-preupload/internal/config"
+	"github.com/bioidaika/vmf-preupload/internal/metadata"
 	"github.com/bioidaika/vmf-preupload/internal/naming"
 	"github.com/bioidaika/vmf-preupload/internal/providers"
 	"github.com/bioidaika/vmf-preupload/internal/rename"
@@ -25,11 +26,12 @@ import (
 type App struct {
 	ctx context.Context
 
-	mu       sync.Mutex
-	settings api.Settings
-	plan     rename.Plan
-	planID   string
-	journal  *rename.Journal
+	mu           sync.Mutex
+	settings     api.Settings
+	plan         rename.Plan
+	planID       string
+	planCanApply bool
+	journal      *rename.Journal
 }
 
 func NewApp() *App {
@@ -122,6 +124,10 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 	if baseMeta.Group == "" {
 		baseMeta.Group = "NoGroup"
 	}
+	preserveExistingP2P := true
+	if request.PreserveExistingP2P != nil {
+		preserveExistingP2P = *request.PreserveExistingP2P
+	}
 
 	if len(scan.Assets) == 0 {
 		return RenamePlan{}, fmt.Errorf("no supported media files found")
@@ -138,31 +144,60 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 	parent := filepath.Dir(root)
 	newRoot := root
 	requests := make([]rename.RenameRequest, 0, len(scan.Assets)+1)
+	displayItems := make([]RenameItem, 0, len(scan.Assets)+1)
 	warnings := append([]string{}, scan.Warnings...)
+	planErrors := []string{}
 
 	// A folder is renamed to the common release name. For a TV folder with
 	// several episodes, omit the episode title/number from the folder name and
 	// retain the season marker as a season-pack identity.
 	if rootIsDir {
-		folderMeta := baseMeta
-		if folderMeta.Category == naming.TV && len(scan.Assets) > 1 {
-			folderMeta.Episode = ""
-			folderMeta.EpisodeTitle = ""
-		}
-		folderName, nameWarnings := naming.Render(folderMeta, profile)
-		warnings = appendNamingWarnings(warnings, nameWarnings)
-		if folderName == "" {
-			return RenamePlan{}, fmt.Errorf("could not render folder name")
-		}
-		newRoot = filepath.Join(parent, folderName)
-		if filepath.Clean(newRoot) != filepath.Clean(root) {
-			requests = append(requests, rename.RenameRequest{Source: root, Destination: newRoot})
+		if preserveExistingP2P && metadata.IsP2PReleaseFolderName(filepath.Base(root)) {
+			displayItems = append(displayItems, RenameItem{OldPath: root, NewPath: root, Kind: "folder", Status: "preserved"})
+		} else {
+			folderMeta := baseMeta
+			if folderMeta.Category == naming.TV && len(scan.Assets) > 1 {
+				folderMeta.Episode = ""
+				folderMeta.EpisodeTitle = ""
+			}
+			folderName, nameWarnings := naming.Render(folderMeta, profile)
+			warnings = appendNamingWarnings(warnings, nameWarnings)
+			if folderName == "" {
+				return RenamePlan{}, fmt.Errorf("could not render folder name")
+			}
+			newRoot = filepath.Join(parent, folderName)
+			if filepath.Clean(newRoot) != filepath.Clean(root) {
+				requests = append(requests, rename.RenameRequest{Source: root, Destination: newRoot})
+			} else {
+				displayItems = append(displayItems, RenameItem{OldPath: root, NewPath: newRoot, Kind: "folder", Status: "same"})
+			}
 		}
 	}
 
 	seenDest := map[string]bool{}
 	for _, asset := range scan.Assets {
 		if !isVideoAsset(asset) {
+			continue
+		}
+		dir := filepath.Dir(asset.Path)
+		if rootIsDir {
+			relativeDir := filepath.Dir(asset.RelativePath)
+			if relativeDir == "." || relativeDir == "" {
+				dir = newRoot
+			} else {
+				dir = filepath.Join(newRoot, relativeDir)
+			}
+		}
+		if preserveExistingP2P && metadata.IsP2PReleaseName(asset.Name) {
+			destination := filepath.Join(dir, asset.Name)
+			key := strings.ToLower(filepath.Clean(destination))
+			if seenDest[key] {
+				appendUnique(&planErrors, "duplicate destination: "+destination)
+				displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "conflict"})
+				continue
+			}
+			seenDest[key] = true
+			displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "preserved"})
 			continue
 		}
 		meta := mergeAssetMetadata(baseMeta, asset)
@@ -185,21 +220,25 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 		if name == "" {
 			continue
 		}
-		dir := filepath.Dir(asset.Path)
-		if rootIsDir {
-			dir = newRoot
-		}
 		destination := filepath.Join(dir, name+filepath.Ext(asset.Path))
 		key := strings.ToLower(filepath.Clean(destination))
 		if seenDest[key] {
-			warnings = append(warnings, "multiple media files resolve to the same destination; review TV episode metadata")
+			appendUnique(&planErrors, "duplicate destination: "+destination)
+			displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "conflict"})
 			continue
 		}
 		seenDest[key] = true
-		requests = append(requests, rename.RenameRequest{Source: asset.Path, Destination: destination})
+		if filepath.Clean(asset.Path) == filepath.Clean(destination) {
+			displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "same"})
+		} else {
+			requests = append(requests, rename.RenameRequest{Source: asset.Path, Destination: destination})
+		}
 	}
 	if len(requests) == 0 {
-		return RenamePlan{}, fmt.Errorf("no rename operations were generated")
+		// BuildPlan intentionally filters exact no-ops. Supplying one here gives
+		// the GUI a stable plan ID while displayItems explains why no filesystem
+		// operation is required.
+		requests = append(requests, rename.RenameRequest{Source: root, Destination: root})
 	}
 	planRoot := parent
 	plan, err := rename.BuildPlan(requests, rename.PlanOptions{Root: planRoot})
@@ -210,10 +249,15 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 	for _, issue := range report.Issues {
 		warnings = append(warnings, issue.Code+": "+issue.Message)
 	}
-	result := a.toRenamePlan(plan, warnings, report)
+	result := a.toRenamePlan(plan, warnings, report, displayItems)
+	for _, message := range planErrors {
+		appendUnique(&result.Errors, message)
+	}
+	result.CanApply = result.ChangeCount > 0 && len(result.Errors) == 0
 	a.mu.Lock()
 	a.plan = plan
 	a.planID = result.ID
+	a.planCanApply = result.CanApply
 	a.mu.Unlock()
 	return result, nil
 }
@@ -222,9 +266,16 @@ func (a *App) ApplyRename(plan RenamePlan) error {
 	a.mu.Lock()
 	internalPlan := a.plan
 	knownID := a.planID
+	canApply := a.planCanApply
 	a.mu.Unlock()
 	if plan.ID == "" || plan.ID != knownID || internalPlan.ID != knownID {
 		return fmt.Errorf("rename plan is stale; refresh the preview")
+	}
+	if len(internalPlan.Operations) == 0 {
+		return fmt.Errorf("nothing to rename; existing names are already correct")
+	}
+	if !canApply {
+		return fmt.Errorf("rename plan has unresolved errors; refresh the preview after fixing them")
 	}
 	journal, err := rename.Apply(a.context(), internalPlan, rename.ApplyOptions{})
 	if journal != nil {
@@ -283,7 +334,11 @@ func (a *App) ResolveTVSeries(id string) (SearchResult, error) {
 }
 
 func (a *App) toScanResult(result api.ScanResult) ScanResult {
-	out := ScanResult{RootPath: result.Root, Files: []ScanFile{}, Warnings: []string{}, Metadata: TechnicalMetadata{MediaType: "movie", Group: "NoGroup"}}
+	fallbackGroup := strings.TrimSpace(a.currentSettings().ReleaseGroup)
+	if fallbackGroup == "" {
+		fallbackGroup = "NoGroup"
+	}
+	out := ScanResult{RootPath: result.Root, Files: []ScanFile{}, Warnings: []string{}, Metadata: TechnicalMetadata{MediaType: "movie", Group: fallbackGroup}}
 	for _, warning := range result.Warnings {
 		appendUnique(&out.Warnings, warning)
 	}
@@ -301,6 +356,10 @@ func (a *App) toScanResult(result api.ScanResult) ScanResult {
 		}
 		if out.Metadata.Title == "" {
 			out.Metadata = contentToDTO(asset.Content, asset.Technical)
+			// A detected third-party group is provenance, not permission to render
+			// a different convention under that group's name. Exact preservation
+			// retains it from the basename; VMF rendering uses the local fallback.
+			out.Metadata.Group = fallbackGroup
 			if asset.Technical.RawJSON != "" {
 				var raw any
 				if json.Unmarshal([]byte(asset.Technical.RawJSON), &raw) == nil {
@@ -319,6 +378,7 @@ func (a *App) toScanResult(result api.ScanResult) ScanResult {
 	if out.Metadata.MediaType == "" {
 		out.Metadata.MediaType = "movie"
 	}
+	out.MediaType = out.Metadata.MediaType
 	// Folder-level metadata drives the live suggested basename. Keep it aligned
 	// with PreviewRename: a pack is UHD only when every source video basename
 	// carries the explicit marker. A single selected file naturally follows
@@ -340,22 +400,20 @@ func appendUnique(values *[]string, value string) {
 	*values = append(*values, value)
 }
 
-func (a *App) toRenamePlan(plan rename.Plan, warnings []string, report rename.ValidationReport) RenamePlan {
-	out := RenamePlan{ID: plan.ID, Items: []RenameItem{}, Warnings: append([]string{}, warnings...), Errors: []string{}}
+func (a *App) toRenamePlan(plan rename.Plan, warnings []string, report rename.ValidationReport, displayItems []RenameItem) RenamePlan {
+	out := RenamePlan{ID: plan.ID, Items: []RenameItem{}, ChangeCount: len(plan.Operations), Warnings: append([]string{}, warnings...), Errors: []string{}}
 	for _, issue := range report.Issues {
 		out.Errors = append(out.Errors, issue.Code+": "+issue.Message)
 	}
 	for _, op := range plan.Operations {
-		status := "ready"
-		if strings.EqualFold(op.Source, op.Destination) {
-			status = "same"
-		}
 		kind := string(op.Kind)
 		if op.Kind == rename.KindDir {
 			kind = "folder"
 		}
-		out.Items = append(out.Items, RenameItem{OldPath: op.Source, NewPath: op.Destination, Kind: kind, Status: status})
+		out.Items = append(out.Items, RenameItem{OldPath: op.Source, NewPath: op.Destination, Kind: kind, Status: "ready"})
 	}
+	out.Items = append(out.Items, displayItems...)
+	out.CanApply = out.ChangeCount > 0 && len(out.Errors) == 0
 	return out
 }
 
@@ -501,27 +559,34 @@ func (a *App) currentSettings() api.Settings {
 }
 
 func settingsToDTO(value api.Settings) Settings {
+	preserveExistingP2P := value.PreserveExistingP2P
 	return Settings{
-		Separator:    value.Separator,
-		Group:        value.ReleaseGroup,
-		IncludeUHD:   value.IncludeUHD,
-		Profile:      value.Profile,
-		TMDBAPIKey:   value.TMDBAPIKey,
-		TVDBAPIKey:   value.TVDBAPIKey,
-		TVDBPIN:      value.TVDBPIN,
-		MediaInfoBin: value.MediaInfoBin,
+		Separator:           value.Separator,
+		Group:               value.ReleaseGroup,
+		PreserveExistingP2P: &preserveExistingP2P,
+		IncludeUHD:          value.IncludeUHD,
+		Profile:             value.Profile,
+		TMDBAPIKey:          value.TMDBAPIKey,
+		TVDBAPIKey:          value.TVDBAPIKey,
+		TVDBPIN:             value.TVDBPIN,
+		MediaInfoBin:        value.MediaInfoBin,
 	}
 }
 
 func settingsFromDTO(value Settings) api.Settings {
+	preserveExistingP2P := true
+	if value.PreserveExistingP2P != nil {
+		preserveExistingP2P = *value.PreserveExistingP2P
+	}
 	return api.Settings{
-		Separator:    value.Separator,
-		ReleaseGroup: value.Group,
-		IncludeUHD:   value.IncludeUHD,
-		Profile:      value.Profile,
-		TMDBAPIKey:   value.TMDBAPIKey,
-		TVDBAPIKey:   value.TVDBAPIKey,
-		TVDBPIN:      value.TVDBPIN,
-		MediaInfoBin: value.MediaInfoBin,
+		Separator:           value.Separator,
+		ReleaseGroup:        value.Group,
+		PreserveExistingP2P: preserveExistingP2P,
+		IncludeUHD:          value.IncludeUHD,
+		Profile:             value.Profile,
+		TMDBAPIKey:          value.TMDBAPIKey,
+		TVDBAPIKey:          value.TVDBAPIKey,
+		TVDBPIN:             value.TVDBPIN,
+		MediaInfoBin:        value.MediaInfoBin,
 	}
 }

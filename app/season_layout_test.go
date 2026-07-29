@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +80,9 @@ func TestPreviewApplyUndoNestedMultiSeasonLayout(t *testing.T) {
 	if err := application.ApplyRename(plan); err != nil {
 		t.Fatalf("ApplyRename: %v", err)
 	}
+	if !application.HasUndoJournal() {
+		t.Fatal("successful season-folder transaction must expose an Undo journal")
+	}
 	seasonLayoutAssertFile(t, episodeOneItem.NewPath, "season-one")
 	seasonLayoutAssertFile(t, episodeTwoItem.NewPath, "season-two")
 	if _, err := os.Stat(root); err != nil {
@@ -87,6 +91,9 @@ func TestPreviewApplyUndoNestedMultiSeasonLayout(t *testing.T) {
 
 	if err := application.UndoRename(); err != nil {
 		t.Fatalf("UndoRename: %v", err)
+	}
+	if application.HasUndoJournal() {
+		t.Fatal("completed Undo must clear the active journal state")
 	}
 	seasonLayoutAssertFile(t, episodeOne, "season-one")
 	seasonLayoutAssertFile(t, episodeTwo, "season-two")
@@ -131,13 +138,15 @@ func TestPreviewApplyUndoFlatMultiSeasonLayout(t *testing.T) {
 	}
 	episodeOneItem := seasonLayoutItemBySource(t, plan, episodeOne, "file")
 	episodeTwoItem := seasonLayoutItemBySource(t, plan, episodeTwo, "file")
-	if filepath.Clean(filepath.Dir(episodeOneItem.NewPath)) != filepath.Clean(rootItem.NewPath) ||
+	seasonOneFolder := seasonLayoutCreatedFolder(t, plan, "S01")
+	seasonTwoFolder := seasonLayoutCreatedFolder(t, plan, "S02")
+	if filepath.Clean(filepath.Dir(episodeOneItem.NewPath)) != filepath.Clean(seasonOneFolder.NewPath) ||
 		!seasonLayoutHasToken(filepath.Base(episodeOneItem.NewPath), "S01E01") {
-		t.Fatalf("flat S01 episode identity or location changed: root=%#v file=%#v", rootItem, episodeOneItem)
+		t.Fatalf("flat S01 episode must move into its created season folder: folder=%#v file=%#v", seasonOneFolder, episodeOneItem)
 	}
-	if filepath.Clean(filepath.Dir(episodeTwoItem.NewPath)) != filepath.Clean(rootItem.NewPath) ||
+	if filepath.Clean(filepath.Dir(episodeTwoItem.NewPath)) != filepath.Clean(seasonTwoFolder.NewPath) ||
 		!seasonLayoutHasToken(filepath.Base(episodeTwoItem.NewPath), "S02E03") {
-		t.Fatalf("flat S02 episode identity or location changed: root=%#v file=%#v", rootItem, episodeTwoItem)
+		t.Fatalf("flat S02 episode must move into its created season folder: folder=%#v file=%#v", seasonTwoFolder, episodeTwoItem)
 	}
 
 	if err := application.ApplyRename(plan); err != nil {
@@ -145,11 +154,21 @@ func TestPreviewApplyUndoFlatMultiSeasonLayout(t *testing.T) {
 	}
 	seasonLayoutAssertFile(t, episodeOneItem.NewPath, "season-one")
 	seasonLayoutAssertFile(t, episodeTwoItem.NewPath, "season-two")
+	for _, original := range []string{episodeOne, episodeTwo} {
+		if _, err := os.Stat(original); !os.IsNotExist(err) {
+			t.Fatalf("flat source still exists after Apply: %s err=%v", original, err)
+		}
+	}
 	if err := application.UndoRename(); err != nil {
 		t.Fatalf("UndoRename: %v", err)
 	}
 	seasonLayoutAssertFile(t, episodeOne, "season-one")
 	seasonLayoutAssertFile(t, episodeTwo, "season-two")
+	for _, folder := range []RenameItem{seasonOneFolder, seasonTwoFolder} {
+		if _, err := os.Stat(folder.NewPath); !os.IsNotExist(err) {
+			t.Fatalf("transaction-created season folder remains after Undo: %s err=%v", folder.NewPath, err)
+		}
+	}
 }
 
 func TestPreviewMixedSeasonFoldersAndDirectEpisodes(t *testing.T) {
@@ -182,14 +201,250 @@ func TestPreviewMixedSeasonFoldersAndDirectEpisodes(t *testing.T) {
 		t.Fatalf("mixed nested/flat plan must explain direct episodes: %#v", plan.Warnings)
 	}
 	seasonOneFolder := seasonLayoutItemBySource(t, plan, seasonOne, "folder")
+	seasonTwoFolder := seasonLayoutCreatedFolder(t, plan, "S02")
 	seasonOneFile := seasonLayoutItemBySource(t, plan, episodeOne, "file")
 	seasonTwoFile := seasonLayoutItemBySource(t, plan, episodeTwo, "file")
 	if filepath.Clean(filepath.Dir(seasonOneFile.NewPath)) != filepath.Clean(seasonOneFolder.NewPath) {
 		t.Fatalf("nested episode escaped its renamed season folder: folder=%#v file=%#v", seasonOneFolder, seasonOneFile)
 	}
-	if filepath.Clean(filepath.Dir(seasonTwoFile.NewPath)) != filepath.Clean(root) ||
+	if filepath.Clean(filepath.Dir(seasonTwoFile.NewPath)) != filepath.Clean(seasonTwoFolder.NewPath) ||
 		!seasonLayoutHasToken(filepath.Base(seasonTwoFile.NewPath), "S02E03") {
-		t.Fatalf("direct S02 episode must remain in the series root: %#v", seasonTwoFile)
+		t.Fatalf("direct S02 episode must move into its created season folder: folder=%#v file=%#v", seasonTwoFolder, seasonTwoFile)
+	}
+
+	if err := application.ApplyRename(plan); err != nil {
+		t.Fatalf("ApplyRename: %v", err)
+	}
+	seasonLayoutAssertFile(t, seasonOneFile.NewPath, "season-one")
+	seasonLayoutAssertFile(t, seasonTwoFile.NewPath, "season-two")
+	if err := application.UndoRename(); err != nil {
+		t.Fatalf("UndoRename: %v", err)
+	}
+	seasonLayoutAssertFile(t, episodeOne, "season-one")
+	seasonLayoutAssertFile(t, episodeTwo, "season-two")
+	if _, err := os.Stat(seasonTwoFolder.NewPath); !os.IsNotExist(err) {
+		t.Fatalf("created S02 folder remains after Undo: %s err=%v", seasonTwoFolder.NewPath, err)
+	}
+}
+
+func TestFlatPreservedP2PFilesMoveIntoCreatedSeasonFolders(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Gotham (2014)")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{
+		"Gotham.S01E01.1080p.WEB-DL.H.264-TestGroup.mkv",
+		"Gotham.S02E01.1080p.WEB-DL.H.264-TestGroup.mkv",
+	}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := NewApp()
+	application.settings.MediaInfoBin = filepath.Join(root, "missing-mediainfo.exe")
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: root, Metadata: seasonLayoutMetadata(), Separator: ".", PreserveExistingP2P: testBoolPointer(true),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if len(plan.Errors) != 0 || !plan.CanApply {
+		t.Fatalf("preserved flat multi-season plan must be applicable: %#v", plan)
+	}
+	for index, name := range names {
+		source := filepath.Join(root, name)
+		item := seasonLayoutItemBySource(t, plan, source, "file")
+		folder := seasonLayoutCreatedFolder(t, plan, fmt.Sprintf("S%02d", index+1))
+		if filepath.Base(item.NewPath) != name || filepath.Clean(filepath.Dir(item.NewPath)) != filepath.Clean(folder.NewPath) {
+			t.Fatalf("P2P basename must be preserved while moving parent: source=%q folder=%#v item=%#v", source, folder, item)
+		}
+	}
+
+	if err := application.ApplyRename(plan); err != nil {
+		t.Fatalf("ApplyRename: %v", err)
+	}
+	for _, name := range names {
+		item := seasonLayoutItemBySource(t, plan, filepath.Join(root, name), "file")
+		seasonLayoutAssertFile(t, item.NewPath, name)
+	}
+	if err := application.UndoRename(); err != nil {
+		t.Fatalf("UndoRename: %v", err)
+	}
+	for _, name := range names {
+		seasonLayoutAssertFile(t, filepath.Join(root, name), name)
+	}
+}
+
+func TestDirectEpisodeUsesExistingSeasonTarget(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Gotham (2014)")
+	seasonOne := filepath.Join(root, "Season 1")
+	if err := os.MkdirAll(seasonOne, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(seasonOne, "Gotham.S01E01.mkv")
+	direct := filepath.Join(root, "Gotham.S01E02.mkv")
+	for path, contents := range map[string]string{nested: "nested", direct: "direct"} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := NewApp()
+	application.settings.MediaInfoBin = filepath.Join(root, "missing-mediainfo.exe")
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: root, Metadata: seasonLayoutMetadata(), Separator: ".", PreserveExistingP2P: testBoolPointer(false),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if len(plan.Errors) != 0 || !plan.CanApply {
+		t.Fatalf("direct episode should join the existing S01 target: %#v", plan)
+	}
+	seasonFolder := seasonLayoutItemBySource(t, plan, seasonOne, "folder")
+	directItem := seasonLayoutItemBySource(t, plan, direct, "file")
+	if filepath.Clean(filepath.Dir(directItem.NewPath)) != filepath.Clean(seasonFolder.NewPath) {
+		t.Fatalf("direct S01 episode did not join existing season target: folder=%#v file=%#v", seasonFolder, directItem)
+	}
+	for _, item := range plan.Items {
+		if item.Kind == "folder" && item.Status == "create" && seasonLayoutHasToken(filepath.Base(item.NewPath), "S01") {
+			t.Fatalf("planner created a duplicate S01 folder: %#v", plan.Items)
+		}
+	}
+}
+
+func TestMixedTechnicalSeasonBucketBlocksApply(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Gotham (2014)")
+	seasonOne := filepath.Join(root, "Season 1")
+	if err := os.MkdirAll(seasonOne, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{
+		filepath.Join(seasonOne, "Gotham.S01E01.1080p.WEB-DL.H.264.mkv"),
+		filepath.Join(root, "Gotham.S01E02.2160p.BluRay.REMUX.H.265.mkv"),
+	}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte(filepath.Base(path)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := NewApp()
+	application.settings.MediaInfoBin = filepath.Join(root, "missing-mediainfo.exe")
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: root, Metadata: seasonLayoutMetadata(), Separator: ".", PreserveExistingP2P: testBoolPointer(false),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if plan.CanApply || !seasonLayoutContainsError(plan, "mixed technical metadata") {
+		t.Fatalf("mixed WEB-DL/REMUX files must not be merged into one season pack: %#v", plan)
+	}
+}
+
+func TestSeasonFolderOmitsPartialServiceAndVMFTag(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Gotham (2014)")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"Gotham.S01E01.ViE.NF.1080p.WEB-DL.H.264.mkv",
+		"Gotham.S01E02.1080p.WEB-DL.H.264.mkv",
+		"Gotham.S02E01.1080p.WEB-DL.H.264.mkv",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := NewApp()
+	application.settings.MediaInfoBin = filepath.Join(root, "missing-mediainfo.exe")
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: root, Metadata: seasonLayoutMetadata(), Separator: ".", PreserveExistingP2P: testBoolPointer(false),
+	})
+	if err != nil {
+		t.Fatalf("PreviewRename: %v", err)
+	}
+	if len(plan.Errors) != 0 || !plan.CanApply {
+		t.Fatalf("partial optional tags should be omitted rather than block the season: %#v", plan)
+	}
+	folder := seasonLayoutCreatedFolder(t, plan, "S01")
+	base := filepath.Base(folder.NewPath)
+	if seasonLayoutHasToken(base, "NF") || seasonLayoutHasToken(base, "ViE") {
+		t.Fatalf("partial service/VMF tag leaked into season folder: %s", base)
+	}
+}
+
+func TestFlatSeasonFolderCreationRejectsExistingDestination(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Gotham (2014)")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Gotham.S01E01.mkv", "Gotham.S02E01.mkv"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := NewApp()
+	application.settings.MediaInfoBin = filepath.Join(root, "missing-mediainfo.exe")
+	request := RenameRequest{RootPath: root, Metadata: seasonLayoutMetadata(), Separator: ".", PreserveExistingP2P: testBoolPointer(false)}
+	first, err := application.PreviewRename(request)
+	if err != nil {
+		t.Fatalf("first PreviewRename: %v", err)
+	}
+	collision := seasonLayoutCreatedFolder(t, first, "S01").NewPath
+	if err := os.Mkdir(collision, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	second, err := application.PreviewRename(request)
+	if err != nil {
+		t.Fatalf("second PreviewRename: %v", err)
+	}
+	if second.CanApply || !seasonLayoutContainsError(second, "directory creation target already exists") {
+		t.Fatalf("existing season target must block folder ownership: %#v", second)
+	}
+}
+
+func TestAppKeepsRetryableUndoAfterCreatedFolderIsNonEmpty(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Gotham (2014)")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Gotham.S01E01.mkv", "Gotham.S02E01.mkv"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := NewApp()
+	application.settings.MediaInfoBin = filepath.Join(root, "missing-mediainfo.exe")
+	plan, err := application.PreviewRename(RenameRequest{
+		RootPath: root, Metadata: seasonLayoutMetadata(), Separator: ".", PreserveExistingP2P: testBoolPointer(false),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seasonOne := seasonLayoutCreatedFolder(t, plan, "S01").NewPath
+	if err := application.ApplyRename(plan); err != nil {
+		t.Fatalf("ApplyRename: %v", err)
+	}
+	foreign := filepath.Join(seasonOne, "user.txt")
+	if err := os.WriteFile(foreign, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.UndoRename(); err == nil || !strings.Contains(strings.ToLower(err.Error()), "not empty") {
+		t.Fatalf("Undo must report the retained foreign file: %v", err)
+	}
+	if !application.HasUndoJournal() || !application.UndoNeedsAttention() {
+		t.Fatal("failed cleanup must remain visible and retryable")
+	}
+	if err := application.ApplyRename(plan); err == nil || !strings.Contains(strings.ToLower(err.Error()), "previous transaction") {
+		t.Fatalf("a new Apply must not overwrite the retry journal: %v", err)
+	}
+	if err := os.Remove(foreign); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.UndoRename(); err != nil {
+		t.Fatalf("retry UndoRename: %v", err)
+	}
+	if application.HasUndoJournal() || application.UndoNeedsAttention() {
+		t.Fatal("successful retry must clear the active Undo state")
 	}
 }
 
@@ -566,6 +821,17 @@ func seasonLayoutItemBySource(t *testing.T, plan RenamePlan, source, kind string
 		}
 	}
 	t.Fatalf("plan has no %s item for %q: %#v", kind, source, plan.Items)
+	return RenameItem{}
+}
+
+func seasonLayoutCreatedFolder(t *testing.T, plan RenamePlan, season string) RenameItem {
+	t.Helper()
+	for _, item := range plan.Items {
+		if item.Kind == "folder" && item.Status == "create" && seasonLayoutHasToken(filepath.Base(item.NewPath), season) {
+			return item
+		}
+	}
+	t.Fatalf("plan has no created %s folder: %#v", season, plan.Items)
 	return RenameItem{}
 }
 

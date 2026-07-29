@@ -32,6 +32,11 @@ type App struct {
 	planID       string
 	planCanApply bool
 	journal      *rename.Journal
+	// journalAttention records a failed Apply/Undo outcome independently of
+	// the last journal state we could persist or reload. In particular, the
+	// in-memory state can already be "applied" when the final journal write
+	// fails, and a failed Undo can leave the on-disk state looking "applied".
+	journalAttention bool
 }
 
 func NewApp() *App {
@@ -195,46 +200,91 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 		destination     string
 		destinationBase string
 		status          string
+		create          bool
 	}
 	seasonDestinations := map[string]string{}
+	seasonDestinationsBySeason := map[string]string{}
 	seasonDestinationCounts := map[string]int{}
-	seasonTargets := make([]seasonRenameTarget, 0, len(seasonLayout.Directories))
+	seasonTargets := make([]seasonRenameTarget, 0, len(seasonLayout.Directories)+len(seasonLayout.Seasons))
+	createDirectories := []string{}
 	if rootIsDir && baseMeta.Category == naming.TV {
-		for _, seasonDirectory := range seasonLayout.Directories {
+		directAssetsBySeason := map[string][]api.Asset{}
+		for _, asset := range scan.Assets {
+			assetKey := appPathKey(asset.Path)
+			season := seasonLayout.AssetSeason[assetKey]
+			if isVideoAsset(asset) && seasonLayout.AssetAtRoot[assetKey] && season != "" {
+				directAssetsBySeason[season] = append(directAssetsBySeason[season], asset)
+			}
+		}
+		existingSeasonCounts := map[string]int{}
+		targetDirectories := append([]tvSeasonDirectory(nil), seasonLayout.Directories...)
+		for index := range targetDirectories {
+			directory := &targetDirectories[index]
+			existingSeasonCounts[directory.Season]++
+			directory.Assets = append(directory.Assets, directAssetsBySeason[directory.Season]...)
+		}
+		if seasonLayout.SeriesRoot {
+			for _, season := range seasonLayout.Seasons {
+				if existingSeasonCounts[season] == 0 && len(directAssetsBySeason[season]) > 0 {
+					targetDirectories = append(targetDirectories, tvSeasonDirectory{Season: season, Assets: directAssetsBySeason[season]})
+				}
+			}
+		}
+
+		for _, seasonDirectory := range targetDirectories {
+			seasonUHD := allVideoAssetsHaveExplicitUHD(seasonDirectory.Assets)
+			if conflict := seasonTechnicalConflict(baseMeta, seasonDirectory.Season, seasonDirectory.Assets, seasonUHD, metadataOverrides); conflict != "" {
+				appendUnique(&planErrors, conflict)
+			}
 			seasonMeta := baseMeta
 			if len(seasonDirectory.Assets) > 0 {
-				seasonMeta = mergeAssetMetadata(baseMeta, seasonDirectory.Assets[0])
-				seasonMeta = preferAssetTechnicalMetadata(seasonMeta, seasonDirectory.Assets[0], metadataOverrides)
+				representative := seasonRepresentativeAsset(seasonDirectory.Assets)
+				seasonMeta = mergeAssetMetadata(baseMeta, representative)
+				seasonMeta = preferAssetTechnicalMetadata(seasonMeta, representative, metadataOverrides)
+				seasonMeta = applyConservativeSeasonTags(seasonMeta, baseMeta, seasonDirectory.Assets, metadataOverrides)
 			}
 			seasonMeta.Season = seasonDirectory.Season
 			seasonMeta.Episode = ""
 			seasonMeta.EpisodeTitle = ""
-			seasonMeta.UHD = allVideoAssetsHaveExplicitUHD(seasonDirectory.Assets)
+			seasonMeta.UHD = seasonUHD
 
-			sourceBase := filepath.Base(seasonDirectory.Source)
+			create := strings.TrimSpace(seasonDirectory.Source) == ""
+			sourceBase := ""
+			if !create {
+				sourceBase = filepath.Base(seasonDirectory.Source)
+			}
 			destinationBase := sourceBase
 			status := "preserved"
-			if !preserveExistingP2P || !metadata.IsP2PReleaseFolderName(sourceBase) {
+			if create || !preserveExistingP2P || !metadata.IsP2PReleaseFolderName(sourceBase) {
 				var nameWarnings []naming.Warning
 				destinationBase, nameWarnings = naming.Render(seasonMeta, profile)
 				warnings = appendNamingWarnings(warnings, nameWarnings)
-				status = "same"
+				if create {
+					status = "create"
+				} else {
+					status = "same"
+				}
 				if destinationBase == "" {
-					appendUnique(&planErrors, "could not render season folder "+seasonDirectory.Source)
+					appendUnique(&planErrors, "could not render season folder S"+seasonDirectory.Season)
 					continue
 				}
 			}
 
 			destination := filepath.Join(newRoot, destinationBase)
-			sourceKey := appPathKey(seasonDirectory.Source)
+			if !create {
+				seasonDestinations[appPathKey(seasonDirectory.Source)] = destination
+			}
+			if seasonDestinationsBySeason[seasonDirectory.Season] == "" {
+				seasonDestinationsBySeason[seasonDirectory.Season] = destination
+			}
 			destinationKey := appPathKey(destination)
-			seasonDestinations[sourceKey] = destination
 			seasonDestinationCounts[destinationKey]++
 			seasonTargets = append(seasonTargets, seasonRenameTarget{
 				directory:       seasonDirectory,
 				destination:     destination,
 				destinationBase: destinationBase,
 				status:          status,
+				create:          create,
 			})
 		}
 
@@ -242,7 +292,15 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 			destinationKey := appPathKey(target.destination)
 			if seasonDestinationCounts[destinationKey] > 1 {
 				appendUnique(&planErrors, "duplicate season destination: "+target.destination)
-				displayItems = append(displayItems, RenameItem{OldPath: target.directory.Source, NewPath: target.destination, Kind: "folder", Status: "conflict"})
+				oldPath := target.directory.Source
+				if target.create {
+					oldPath = "(new season folder)"
+				}
+				displayItems = append(displayItems, RenameItem{OldPath: oldPath, NewPath: target.destination, Kind: "folder", Status: "conflict"})
+				continue
+			}
+			if target.create {
+				createDirectories = append(createDirectories, target.destination)
 				continue
 			}
 			sourceBase := filepath.Base(target.directory.Source)
@@ -263,9 +321,11 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 			continue
 		}
 		dir := filepath.Dir(asset.Path)
+		assetKey := appPathKey(asset.Path)
 		if rootIsDir {
-			dir = mappedAssetDirectory(asset, newRoot, seasonLayout, seasonDestinations)
+			dir = mappedAssetDirectory(asset, newRoot, seasonLayout, seasonDestinations, seasonDestinationsBySeason)
 		}
+		requiresExplicitMove := rootIsDir && seasonLayout.AssetAtRoot[assetKey] && appPathKey(dir) != appPathKey(newRoot)
 		if preserveExistingP2P && metadata.IsP2PReleaseName(asset.Name) {
 			destination := filepath.Join(dir, asset.Name)
 			key := strings.ToLower(filepath.Clean(destination))
@@ -276,12 +336,15 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 				continue
 			}
 			seenDest[key] = true
-			displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "preserved"})
+			if requiresExplicitMove {
+				requests = append(requests, rename.RenameRequest{Source: asset.Path, Destination: destination})
+			} else {
+				displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "preserved"})
+			}
 			continue
 		}
 		meta := mergeAssetMetadata(baseMeta, asset)
 		if baseMeta.Category == naming.TV {
-			assetKey := appPathKey(asset.Path)
 			if season := seasonLayout.AssetSeason[assetKey]; season != "" {
 				meta.Season = season
 			}
@@ -318,7 +381,7 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 			continue
 		}
 		seenDest[key] = true
-		if filepath.Base(asset.Path) == filepath.Base(destination) {
+		if filepath.Base(asset.Path) == filepath.Base(destination) && !requiresExplicitMove {
 			displayItems = append(displayItems, RenameItem{OldPath: asset.Path, NewPath: destination, Kind: "file", Status: "same"})
 		} else {
 			requests = append(requests, rename.RenameRequest{Source: asset.Path, Destination: destination})
@@ -331,7 +394,13 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 		requests = append(requests, rename.RenameRequest{Source: root, Destination: root})
 	}
 	planRoot := parent
-	plan, err := rename.BuildPlan(requests, rename.PlanOptions{Root: planRoot})
+	if rootIsDir && seasonLayout.SeriesRoot {
+		// The series container itself stays in place, so it is the narrowest
+		// safety scope. This also keeps staging/journal files beside the selected
+		// series instead of one directory above its media parent.
+		planRoot = root
+	}
+	plan, err := rename.BuildPlan(requests, rename.PlanOptions{Root: planRoot, CreateDirectories: createDirectories})
 	if err != nil {
 		return RenamePlan{}, err
 	}
@@ -363,20 +432,26 @@ func (a *App) ApplyRename(plan RenamePlan) error {
 	internalPlan := a.plan
 	knownID := a.planID
 	canApply := a.planCanApply
+	previousJournal := a.journal
+	previousJournalAttention := a.journalAttention
 	a.mu.Unlock()
+	if previousJournalAttention || journalNeedsAttention(previousJournal) {
+		return fmt.Errorf("the previous transaction still requires Undo cleanup")
+	}
 	if plan.ID == "" || plan.ID != knownID || internalPlan.ID != knownID {
 		return fmt.Errorf("rename plan is stale; refresh the preview")
 	}
-	if len(internalPlan.Operations) == 0 {
+	if len(internalPlan.Operations) == 0 && len(internalPlan.Directories) == 0 {
 		return fmt.Errorf("nothing to rename; existing names are already correct")
 	}
 	if !canApply {
 		return fmt.Errorf("rename plan has unresolved errors; refresh the preview after fixing them")
 	}
 	journal, err := rename.Apply(a.context(), internalPlan, rename.ApplyOptions{})
-	if journal != nil {
+	if journal != nil && journal.State != rename.JournalRolledBack {
 		a.mu.Lock()
 		a.journal = journal
+		a.journalAttention = err != nil || journalNeedsAttention(journal)
 		a.mu.Unlock()
 	}
 	if err != nil {
@@ -392,7 +467,54 @@ func (a *App) UndoRename() error {
 	if journal == nil || journal.Path == "" {
 		return fmt.Errorf("there is no completed rename transaction to undo")
 	}
-	return rename.Undo(a.context(), journal.Path)
+	if err := rename.Undo(a.context(), journal.Path); err != nil {
+		activeJournal := journal
+		if loaded, loadErr := rename.LoadJournal(journal.Path); loadErr == nil {
+			activeJournal = loaded
+		}
+		a.mu.Lock()
+		a.journal = activeJournal
+		// The operation outcome is authoritative here. A journal reload can
+		// legitimately still say "applied" when Undo failed before its next
+		// durable state write.
+		a.journalAttention = true
+		a.mu.Unlock()
+		return err
+	}
+	a.mu.Lock()
+	a.journal = nil
+	a.journalAttention = false
+	a.mu.Unlock()
+	return nil
+}
+
+// HasUndoJournal lets the GUI keep a retryable Undo visible after a partial
+// cleanup error without guessing from an error string. Fully rolled-back
+// journals need no action even though their audit file remains on disk.
+func (a *App) HasUndoJournal() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.journal != nil && a.journal.Path != "" && (a.journalAttention || a.journal.State != rename.JournalRolledBack)
+}
+
+// UndoNeedsAttention distinguishes a normal applied journal from a failed or
+// interrupted transaction which must not be overwritten by a new Apply.
+func (a *App) UndoNeedsAttention() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.journalAttention || journalNeedsAttention(a.journal)
+}
+
+func journalNeedsAttention(journal *rename.Journal) bool {
+	if journal == nil {
+		return false
+	}
+	switch journal.State {
+	case rename.JournalApplied, rename.JournalRolledBack:
+		return false
+	default:
+		return true
+	}
 }
 
 func (a *App) SearchMovie(query string) ([]SearchResult, error) {
@@ -528,9 +650,20 @@ func appendUnique(values *[]string, value string) {
 }
 
 func (a *App) toRenamePlan(plan rename.Plan, warnings []string, report rename.ValidationReport, displayItems []RenameItem) RenamePlan {
-	out := RenamePlan{ID: plan.ID, Items: []RenameItem{}, ChangeCount: len(plan.Operations), Warnings: append([]string{}, warnings...), Errors: []string{}}
+	out := RenamePlan{ID: plan.ID, Items: []RenameItem{}, ChangeCount: len(plan.Operations) + len(plan.Directories), Warnings: append([]string{}, warnings...), Errors: []string{}}
+	conflictingDirectories := map[string]bool{}
 	for _, issue := range report.Issues {
 		out.Errors = append(out.Errors, issue.Code+": "+issue.Message)
+		if issue.Destination != "" {
+			conflictingDirectories[appPathKey(issue.Destination)] = true
+		}
+	}
+	for _, directory := range plan.Directories {
+		status := "create"
+		if conflictingDirectories[appPathKey(directory.Path)] {
+			status = "conflict"
+		}
+		out.Items = append(out.Items, RenameItem{OldPath: "", NewPath: directory.Path, Kind: "folder", Status: status})
 	}
 	for _, op := range plan.Operations {
 		kind := string(op.Kind)
@@ -685,6 +818,153 @@ func preferAssetTechnicalMetadata(meta naming.Metadata, asset api.Asset, overrid
 		meta.AudioTracks = requestedTracks
 	}
 	return meta
+}
+
+// seasonTechnicalConflict prevents a season pack from advertising only the
+// first episode's technical signature when the files would render different
+// folder names. Explicit UI overrides are honored before signatures are
+// compared, and UHD uses the pack-level all-files rule for every candidate.
+func seasonTechnicalConflict(base naming.Metadata, season string, assets []api.Asset, uhd bool, overrides map[string]bool) string {
+	if len(assets) < 2 {
+		return ""
+	}
+	type observedValue struct {
+		value string
+		asset string
+	}
+	observed := map[string]observedValue{}
+	for _, asset := range assets {
+		meta := mergeAssetMetadata(base, asset)
+		meta = preferAssetTechnicalMetadata(meta, asset, overrides)
+		meta.Season = season
+		meta.Episode = ""
+		meta.EpisodeTitle = ""
+		meta.UHD = uhd
+		assetName := filepath.Base(asset.Path)
+		for _, field := range seasonTechnicalFields(meta) {
+			if strings.TrimSpace(field.value) == "" {
+				continue
+			}
+			key := technicalComparisonKey(field.value)
+			if previous, ok := observed[field.name]; ok && previous.value != key {
+				return fmt.Sprintf(
+					"season layout: S%s contains mixed technical metadata (%s) between %s and %s; split the release or override that field",
+					season,
+					field.name,
+					previous.asset,
+					assetName,
+				)
+			}
+			if _, ok := observed[field.name]; !ok {
+				observed[field.name] = observedValue{value: key, asset: assetName}
+			}
+		}
+	}
+	return ""
+}
+
+type seasonTechnicalField struct {
+	name  string
+	value string
+}
+
+func seasonTechnicalFields(meta naming.Metadata) []seasonTechnicalField {
+	return []seasonTechnicalField{
+		{"release type", meta.ReleaseType},
+		{"source", meta.Source},
+		{"service", meta.Service},
+		{"resolution", meta.Resolution},
+		{"HDR", meta.HDR},
+		{"video codec", meta.VideoCodec},
+		{"video encoder", meta.VideoEncode},
+		{"audio", meta.Audio},
+	}
+}
+
+func technicalComparisonKey(value string) string {
+	compact := strings.ToUpper(strings.NewReplacer(" ", "", ".", "", "-", "", "_", "").Replace(strings.TrimSpace(value)))
+	switch compact {
+	case "AVC", "H264", "X264":
+		return "H264"
+	case "HEVC", "H265", "X265":
+		return "H265"
+	}
+	return compact
+}
+
+func seasonRepresentativeAsset(assets []api.Asset) api.Asset {
+	best := assets[0]
+	bestScore := seasonAssetEvidenceScore(best)
+	for _, asset := range assets[1:] {
+		score := seasonAssetEvidenceScore(asset)
+		if score > bestScore || score == bestScore && appPathKey(asset.Path) < appPathKey(best.Path) {
+			best, bestScore = asset, score
+		}
+	}
+	return best
+}
+
+func seasonAssetEvidenceScore(asset api.Asset) int {
+	score := 0
+	for _, value := range []string{
+		asset.Content.Source,
+		asset.Content.Service,
+		asset.Content.Resolution,
+		asset.Content.VideoCodec,
+		asset.Content.VideoEncode,
+		asset.Content.HDR,
+		asset.Content.Audio,
+	} {
+		if strings.TrimSpace(value) != "" {
+			score++
+		}
+	}
+	if hasReleaseTypeEvidence(asset.Name) {
+		score += 2
+	}
+	if strings.TrimSpace(asset.Technical.RawJSON) != "" {
+		score += 4
+	}
+	return score
+}
+
+// applyConservativeSeasonTags keeps pack-level optional tags only when every
+// episode supports the same claim. A single NF/ViE/DUB episode must not label
+// an otherwise untagged season; explicit UI overrides remain authoritative.
+func applyConservativeSeasonTags(folder, base naming.Metadata, assets []api.Asset, overrides map[string]bool) naming.Metadata {
+	if len(assets) == 0 {
+		return folder
+	}
+	if !overrides["service"] {
+		commonService := ""
+		for index, asset := range assets {
+			meta := preferAssetTechnicalMetadata(mergeAssetMetadata(base, asset), asset, overrides)
+			service := strings.TrimSpace(meta.Service)
+			if service == "" || index > 0 && !strings.EqualFold(service, commonService) {
+				commonService = ""
+				break
+			}
+			commonService = service
+		}
+		folder.Service = commonService
+	}
+	if !overrides["languages"] {
+		commonTag := ""
+		for index, asset := range assets {
+			meta := preferAssetTechnicalMetadata(mergeAssetMetadata(base, asset), asset, overrides)
+			tag := strings.TrimSpace(naming.VMFTag(meta))
+			if tag == "" || index > 0 && !strings.EqualFold(tag, commonTag) {
+				commonTag = ""
+				break
+			}
+			commonTag = tag
+		}
+		if commonTag == "" {
+			folder.AudioTracks = nil
+			folder.ExistingName = ""
+		}
+	}
+	return folder
 }
 
 func makeMetadataOverrideSet(values []string) map[string]bool {

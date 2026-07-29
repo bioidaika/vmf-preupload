@@ -260,7 +260,7 @@ function normalizeRenamePlan(value: RenamePlan | null | undefined): RenamePlan {
   const items = Array.isArray(value.items) ? value.items : []
   const warnings = Array.isArray(value.warnings) ? value.warnings : []
   const errors = Array.isArray(value.errors) ? value.errors : []
-  const changeCount = Number.isFinite(value.changeCount) ? value.changeCount : items.filter((item) => item.status === 'ready').length
+  const changeCount = Number.isFinite(value.changeCount) ? value.changeCount : items.filter((item) => item.status === 'ready' || item.status === 'create').length
   return { ...value, items, warnings, errors, changeCount, canApply: typeof value.canApply === 'boolean' ? value.canApply : changeCount > 0 && errors.length === 0 }
 }
 
@@ -272,6 +272,8 @@ export interface RenamerState {
   selectedPath: string
   busy: boolean
   applied: boolean
+  canUndo: boolean
+  undoNeedsAttention: boolean
   error: string
   notice: string
   bridgeConnected: boolean
@@ -298,6 +300,8 @@ export function useRenamer(): RenamerState {
   const [selectedPath, setSelectedPath] = useState('C:\\Media\\Example.Movie.2026.mkv')
   const [busy, setBusy] = useState(false)
   const [applied, setApplied] = useState(false)
+  const [canUndo, setCanUndo] = useState(false)
+  const [undoNeedsAttention, setUndoNeedsAttention] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -310,6 +314,8 @@ export function useRenamer(): RenamerState {
         setMetadata((current) => ({ ...current, group: next.group || current.group }))
       })
       .catch((cause) => setError(cause instanceof Error ? cause.message : 'Could not load settings.'))
+    void bridge.HasUndoJournal().then(setCanUndo).catch(() => undefined)
+    void bridge.UndoNeedsAttention().then(setUndoNeedsAttention).catch(() => undefined)
   }, [])
 
   const updateMetadata = useCallback((patch: Partial<TechnicalMetadata>) => {
@@ -458,18 +464,30 @@ export function useRenamer(): RenamerState {
     try {
       await bridge.ApplyRename(plan)
       setApplied(true)
+      setCanUndo(true)
+      setUndoNeedsAttention(false)
       setNotice('Rename applied. A journal entry is ready to undo.')
     } catch (cause) {
       setApplied(false)
       if (isBridgeError(cause)) {
+        setCanUndo(false)
+        setUndoNeedsAttention(false)
         setNotice('Browser preview: no files were changed.')
       } else {
+        const [retryableUndo, needsAttention] = await Promise.all([
+          bridge.HasUndoJournal().catch(() => false),
+          bridge.UndoNeedsAttention().catch(() => false),
+        ])
+        setCanUndo(retryableUndo)
+        setUndoNeedsAttention(needsAttention)
         // Do not mark a failed backend transaction as applied. Apply may have
         // rolled back automatically, but the UI must not claim success or
         // disable retry while exposing an undo action for a nonexistent
         // transaction.
         setError(cause instanceof Error ? cause.message : 'Could not apply the rename plan.')
-        setNotice('Rename failed; no successful transaction was recorded.')
+        setNotice(needsAttention
+          ? 'Rename failed; a partial transaction can be retried with Undo.'
+          : 'Rename failed; no successful transaction was recorded.')
       }
     } finally {
       setBusy(false)
@@ -482,12 +500,22 @@ export function useRenamer(): RenamerState {
     try {
       await bridge.UndoRename()
       setApplied(false)
+      setCanUndo(false)
+      setUndoNeedsAttention(false)
       setNotice('The last rename was undone.')
     } catch (cause) {
       setApplied(false)
       if (isBridgeError(cause)) {
+        setCanUndo(false)
+        setUndoNeedsAttention(false)
         setNotice('Browser preview: no filesystem changes to undo.')
       } else {
+        const [retryableUndo, needsAttention] = await Promise.all([
+          bridge.HasUndoJournal().catch(() => true),
+          bridge.UndoNeedsAttention().catch(() => true),
+        ])
+        setCanUndo(retryableUndo)
+        setUndoNeedsAttention(needsAttention)
         setError(cause instanceof Error ? cause.message : 'Could not undo the last rename.')
         setNotice('Undo failed; inspect the latest journal before retrying.')
       }
@@ -543,6 +571,8 @@ export function useRenamer(): RenamerState {
     selectedPath,
     busy,
     applied,
+    canUndo,
+    undoNeedsAttention,
     error,
     notice,
     bridgeConnected: isBridgeAvailable(),

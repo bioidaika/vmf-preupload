@@ -49,7 +49,7 @@ export interface RenameItem {
   oldPath: string
   newPath: string
   kind: 'file' | 'folder'
-  status?: 'ready' | 'same' | 'preserved' | 'conflict' | 'warning'
+  status?: 'ready' | 'create' | 'same' | 'preserved' | 'conflict' | 'warning'
 }
 
 export interface RenamePlan {

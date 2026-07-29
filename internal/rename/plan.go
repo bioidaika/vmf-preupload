@@ -15,7 +15,7 @@ import (
 // reported by Preflight (and are checked again by Apply immediately before
 // execution).
 func BuildPlan(requests []RenameRequest, options PlanOptions) (Plan, error) {
-	if len(requests) == 0 {
+	if len(requests) == 0 && len(options.CreateDirectories) == 0 {
 		return Plan{}, fmt.Errorf("rename plan is empty")
 	}
 
@@ -63,7 +63,26 @@ func BuildPlan(requests []RenameRequest, options PlanOptions) (Plan, error) {
 		}
 		ops = append(ops, op)
 	}
-	if len(ops) == 0 {
+
+	directories := make([]DirectoryCreation, 0, len(options.CreateDirectories))
+	seenDirectory := make(map[string]struct{}, len(options.CreateDirectories))
+	for i, requested := range options.CreateDirectories {
+		path, err := absoluteClean(requested, root)
+		if err != nil {
+			return Plan{}, fmt.Errorf("create directory %d: %w", i, err)
+		}
+		key := pathKey(path)
+		if _, exists := seenDirectory[key]; exists {
+			return Plan{}, fmt.Errorf("create directory %d: duplicate path %q", i, path)
+		}
+		seenDirectory[key] = struct{}{}
+		directories = append(directories, DirectoryCreation{
+			ID:   fmt.Sprintf("mkdir-%03d", len(directories)+1),
+			Path: path,
+		})
+	}
+
+	if len(ops) == 0 && len(directories) == 0 {
 		// A plan with only exact no-ops is useful to the GUI (it can display a
 		// successful dry-run), so retain a valid empty plan instead of failing.
 		if root == "" {
@@ -74,9 +93,12 @@ func BuildPlan(requests []RenameRequest, options PlanOptions) (Plan, error) {
 	}
 
 	if root == "" {
-		paths := make([]string, 0, len(ops)*2)
+		paths := make([]string, 0, len(ops)*2+len(directories))
 		for _, op := range ops {
 			paths = append(paths, op.Source, op.Destination)
+		}
+		for _, directory := range directories {
+			paths = append(paths, directory.Path)
 		}
 		root = commonAncestor(paths)
 	} else if !options.AllowOutsideRoot {
@@ -98,6 +120,7 @@ func BuildPlan(requests []RenameRequest, options PlanOptions) (Plan, error) {
 		AllowOutsideRoot: options.AllowOutsideRoot,
 		CreatedAt:        time.Now().UTC(),
 		Operations:       ops,
+		Directories:      directories,
 	}
 	// Static validation catches malformed names and duplicate paths before a
 	// preview is shown.  Filesystem-dependent checks remain in Preflight.
@@ -150,6 +173,37 @@ func staticValidation(plan Plan) ValidationReport {
 			}
 		}
 	}
+	directories := make(map[string]int, len(plan.Directories))
+	for i, directory := range plan.Directories {
+		if strings.TrimSpace(directory.Path) == "" {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "directory_path_empty", Message: fmt.Sprintf("directory creation %d has an empty path", i)})
+			continue
+		}
+		key := pathKey(directory.Path)
+		if previous, ok := directories[key]; ok {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "duplicate_directory", Destination: directory.Path, Message: fmt.Sprintf("directory is also created by entry %d", previous+1)})
+		} else {
+			directories[key] = i
+		}
+		if issue := validateWindowsPath(directory.Path); issue != "" {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "invalid_directory_name", Destination: directory.Path, Message: issue})
+		}
+		if !plan.AllowOutsideRoot && plan.Root != "" && !pathWithin(directory.Path, plan.Root) {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "outside_root", Destination: directory.Path, Message: "directory creation escapes the plan root"})
+		}
+		if _, conflict := sources[key]; conflict {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "directory_source_conflict", Destination: directory.Path, Message: "directory creation is also a rename source"})
+		}
+		if _, conflict := destinations[key]; conflict {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "directory_destination_conflict", Destination: directory.Path, Message: "directory creation is also a rename destination"})
+		}
+		for _, op := range plan.Operations {
+			if op.Kind == KindDir && pathWithin(directory.Path, op.Source) {
+				report.Issues = append(report.Issues, ValidationIssue{Code: "directory_inside_source", Path: op.Source, Destination: directory.Path, Message: "cannot create a directory inside a directory which will be staged"})
+				break
+			}
+		}
+	}
 	return report
 }
 
@@ -161,17 +215,21 @@ func Preflight(plan Plan) ValidationReport {
 	if plan.Version == 0 {
 		plan.Version = planVersion
 	}
-	if len(plan.Operations) == 0 {
+	if len(plan.Operations) == 0 && len(plan.Directories) == 0 {
 		return report
 	}
 
 	sourceByKey := make(map[string]int, len(plan.Operations))
-	destinationByKey := make(map[string]int, len(plan.Operations))
-	destinationKinds := make(map[string]EntryKind, len(plan.Operations))
+	destinationKinds := make(map[string]EntryKind, len(plan.Operations)+len(plan.Directories))
+	creationKinds := make(map[string]EntryKind, len(plan.Directories))
 	for i, op := range plan.Operations {
 		sourceByKey[pathKey(op.Source)] = i
-		destinationByKey[pathKey(op.Destination)] = i
 		destinationKinds[pathKey(op.Destination)] = op.Kind
+	}
+	for _, directory := range plan.Directories {
+		key := pathKey(directory.Path)
+		destinationKinds[key] = KindDir
+		creationKinds[key] = KindDir
 	}
 
 	for i, op := range plan.Operations {
@@ -206,7 +264,7 @@ func Preflight(plan Plan) ValidationReport {
 		}
 
 		parent := filepath.Dir(op.Destination)
-		if issue := validateDestinationParent(parent, destinationByKey, destinationKinds); issue != "" {
+		if issue := validateDestinationParent(parent, destinationKinds, creationKinds); issue != "" {
 			report.Issues = append(report.Issues, ValidationIssue{Code: "destination_parent", Destination: op.Destination, Message: issue})
 		}
 
@@ -215,6 +273,17 @@ func Preflight(plan Plan) ValidationReport {
 			report.Issues = append(report.Issues, ValidationIssue{Code: "directory_into_itself", Path: op.Source, Destination: op.Destination, Message: "a directory cannot be moved into one of its own descendants"})
 		}
 		_ = i // retained for clear correspondence with source/destination maps
+	}
+
+	for _, directory := range plan.Directories {
+		if existing, err := pathExistsCaseInsensitive(directory.Path); err != nil {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "directory_unreadable", Destination: directory.Path, Message: fmt.Sprintf("cannot inspect directory creation target: %v", err)})
+		} else if existing {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "directory_exists", Destination: directory.Path, Message: "directory creation target already exists"})
+		}
+		if issue := validateDestinationParent(filepath.Dir(directory.Path), creationKinds, creationKinds); issue != "" {
+			report.Issues = append(report.Issues, ValidationIssue{Code: "directory_parent", Destination: directory.Path, Message: issue})
+		}
 	}
 
 	// A destination that is a descendant of a source belonging to a different
@@ -247,21 +316,37 @@ func Preflight(plan Plan) ValidationReport {
 	return report
 }
 
-func validateDestinationParent(parent string, destinationByKey map[string]int, destinationKinds map[string]EntryKind) string {
+func validateDestinationParent(parent string, destinationKinds, creationKinds map[string]EntryKind) string {
+	original := filepath.Clean(parent)
 	for current := filepath.Clean(parent); ; current = filepath.Dir(current) {
 		if exists, err := pathExistsCaseInsensitive(current); err == nil && exists {
-			info, err := os.Stat(current)
+			actual, found, findErr := findCaseInsensitivePath(current)
+			if findErr != nil {
+				return fmt.Sprintf("cannot locate destination parent: %v", findErr)
+			}
+			if !found {
+				return "destination parent disappeared while it was inspected"
+			}
+			info, err := os.Stat(actual)
 			if err != nil {
 				return fmt.Sprintf("cannot stat destination parent: %v", err)
 			}
 			if !info.IsDir() {
 				return "destination parent is not a directory"
 			}
+			if pathKey(current) != pathKey(original) {
+				return fmt.Sprintf("destination parent %q does not exist and is not planned", original)
+			}
 			return ""
+		} else if err != nil {
+			return fmt.Sprintf("cannot inspect destination parent: %v", err)
 		}
 		if kind, planned := destinationKinds[pathKey(current)]; planned {
 			if kind != KindDir {
 				return "destination parent is planned to be a file"
+			}
+			if _, created := creationKinds[pathKey(current)]; created && pathKey(current) != pathKey(original) {
+				return fmt.Sprintf("destination parent %q contains an intermediate directory which is not planned", original)
 			}
 			return ""
 		}

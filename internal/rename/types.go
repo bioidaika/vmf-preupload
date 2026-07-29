@@ -88,27 +88,39 @@ type Operation struct {
 	Snapshot    Snapshot  `json:"snapshot"`
 }
 
+// DirectoryCreation is an explicit directory which must be created before
+// rename destinations are committed.  It is kept separate from Operation:
+// a directory creation has no source to snapshot or stage, and pretending it
+// is a rename would weaken the transaction's source-existence guarantees.
+type DirectoryCreation struct {
+	ID   string `json:"id"`
+	Path string `json:"path"`
+}
+
 // Plan is immutable input to Apply.  Root is the common safety scope used to
 // choose a staging directory and default journal path.  AllowOutsideRoot is
 // recorded so a serialized plan has the same safety semantics when reopened.
 type Plan struct {
-	Version          int         `json:"version"`
-	ID               string      `json:"id"`
-	Root             string      `json:"root"`
-	AllowOutsideRoot bool        `json:"allow_outside_root,omitempty"`
-	CreatedAt        time.Time   `json:"created_at"`
-	Operations       []Operation `json:"operations"`
+	Version          int                 `json:"version"`
+	ID               string              `json:"id"`
+	Root             string              `json:"root"`
+	AllowOutsideRoot bool                `json:"allow_outside_root,omitempty"`
+	CreatedAt        time.Time           `json:"created_at"`
+	Operations       []Operation         `json:"operations"`
+	Directories      []DirectoryCreation `json:"directories,omitempty"`
 }
 
 // PlanOptions controls BuildPlan.  The default is conservative: paths are
 // resolved against the current working directory (or Root), destinations
 // must remain in Root when Root is supplied, and exact no-op requests are
 // omitted.  Case-only renames are retained because they are common on
-// Windows and are handled through the temporary phase.
+// Windows and are handled through the temporary phase. CreateDirectories is
+// an explicit allow-list; BuildPlan never infers missing destination parents.
 type PlanOptions struct {
-	Root             string `json:"root,omitempty"`
-	AllowOutsideRoot bool   `json:"allow_outside_root,omitempty"`
-	IncludeNoop      bool   `json:"include_noop,omitempty"`
+	Root              string   `json:"root,omitempty"`
+	AllowOutsideRoot  bool     `json:"allow_outside_root,omitempty"`
+	IncludeNoop       bool     `json:"include_noop,omitempty"`
+	CreateDirectories []string `json:"create_directories,omitempty"`
 }
 
 const planVersion = 1
@@ -138,28 +150,38 @@ type JournalOperation struct {
 	UndoPhase2Done bool   `json:"undo_phase2_done,omitempty"`
 }
 
+// JournalDirectoryCreation records ownership of a directory created by this
+// transaction.  Rollback and Undo only consider entries whose Created flag
+// was set after a successful os.Mkdir, and remove them only while empty.
+type JournalDirectoryCreation struct {
+	DirectoryCreation
+	Created bool `json:"created,omitempty"`
+	Removed bool `json:"removed,omitempty"`
+}
+
 // Journal is an append-by-rewrite JSON journal.  Path is included in JSON so
 // a GUI can pass the file to Undo after restarting the app.
 type Journal struct {
-	Version    int                `json:"version"`
-	ID         string             `json:"id"`
-	PlanID     string             `json:"plan_id"`
-	Root       string             `json:"root"`
-	StageRoot  string             `json:"stage_root"`
-	Path       string             `json:"path"`
-	State      JournalState       `json:"state"`
-	CreatedAt  time.Time          `json:"created_at"`
-	StartedAt  time.Time          `json:"started_at,omitempty"`
-	FinishedAt time.Time          `json:"finished_at,omitempty"`
-	Error      string             `json:"error,omitempty"`
-	Operations []JournalOperation `json:"operations"`
+	Version     int                        `json:"version"`
+	ID          string                     `json:"id"`
+	PlanID      string                     `json:"plan_id"`
+	Root        string                     `json:"root"`
+	StageRoot   string                     `json:"stage_root"`
+	Path        string                     `json:"path"`
+	State       JournalState               `json:"state"`
+	CreatedAt   time.Time                  `json:"created_at"`
+	StartedAt   time.Time                  `json:"started_at,omitempty"`
+	FinishedAt  time.Time                  `json:"finished_at,omitempty"`
+	Error       string                     `json:"error,omitempty"`
+	Operations  []JournalOperation         `json:"operations"`
+	Directories []JournalDirectoryCreation `json:"directories,omitempty"`
 }
 
 // Progress is emitted by Apply/Undo when OnProgress is set.
 type Progress struct {
 	JournalID   string `json:"journal_id"`
 	OperationID string `json:"operation_id"`
-	Phase       string `json:"phase"` // stage, commit, undo-stage, undo-commit
+	Phase       string `json:"phase"` // stage, mkdir, commit, undo-stage, undo-commit
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
 	Completed   int    `json:"completed"`

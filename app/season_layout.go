@@ -35,6 +35,7 @@ type tvSeasonLayout struct {
 	AssetDirectory   map[string]string
 	AssetSeason      map[string]string
 	AssetEpisode     map[string]string
+	AssetAtRoot      map[string]bool
 	DirectVideoCount int
 	ValidationErrors []string
 }
@@ -50,6 +51,7 @@ func analyzeTVSeasonLayout(root string, assets []api.Asset) tvSeasonLayout {
 		AssetDirectory: map[string]string{},
 		AssetSeason:    map[string]string{},
 		AssetEpisode:   map[string]string{},
+		AssetAtRoot:    map[string]bool{},
 	}
 	seasonSet := map[string]bool{}
 	directories := map[string]*tvSeasonDirectory{}
@@ -69,6 +71,7 @@ func analyzeTVSeasonLayout(root string, assets []api.Asset) tvSeasonLayout {
 		parts := splitRelativePath(relative)
 		if len(parts) == 1 {
 			layout.DirectVideoCount++
+			layout.AssetAtRoot[assetKey] = true
 		}
 		if len(parts) >= 2 {
 			folderName := parts[0]
@@ -149,25 +152,35 @@ func analyzeTVSeasonLayout(root string, assets []api.Asset) tvSeasonLayout {
 func tvSeasonLayoutWarnings(layout tvSeasonLayout) []string {
 	warnings := []string{}
 	if layout.MultiSeason && len(layout.Directories) == 0 {
-		warnings = append(warnings, "flat multi-season layout detected; episode files will remain in the series folder")
+		if layout.DirectVideoCount > 0 {
+			warnings = append(warnings, "flat multi-season layout detected; Build plan will organize direct episodes into season folders")
+		} else {
+			warnings = append(warnings, "multi-season layout detected in unrecognized subfolders; their relative layout will be retained")
+		}
 	}
 	if layout.DirectVideoCount > 0 && len(layout.Directories) > 0 {
 		warnings = append(warnings, fmt.Sprintf(
-			"mixed season layout detected; %d episode file(s) at the series root will remain there",
+			"mixed season layout detected; Build plan will move %d direct episode file(s) into matching season folders",
 			layout.DirectVideoCount,
 		))
 	}
 	return warnings
 }
 
-func mappedAssetDirectory(asset api.Asset, newRoot string, layout tvSeasonLayout, seasonDestinations map[string]string) string {
-	sourceDirectory := layout.AssetDirectory[appPathKey(asset.Path)]
+func mappedAssetDirectory(asset api.Asset, newRoot string, layout tvSeasonLayout, seasonDestinations, destinationsBySeason map[string]string) string {
+	assetKey := appPathKey(asset.Path)
+	sourceDirectory := layout.AssetDirectory[assetKey]
 	if sourceDirectory != "" {
 		if destinationDirectory := seasonDestinations[appPathKey(sourceDirectory)]; destinationDirectory != "" {
 			remainder, err := filepath.Rel(sourceDirectory, filepath.Dir(asset.Path))
 			if err == nil && remainder != "." && remainder != "" {
 				return filepath.Join(destinationDirectory, remainder)
 			}
+			return destinationDirectory
+		}
+	}
+	if layout.AssetAtRoot[assetKey] {
+		if destinationDirectory := destinationsBySeason[layout.AssetSeason[assetKey]]; destinationDirectory != "" {
 			return destinationDirectory
 		}
 	}

@@ -6,7 +6,44 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bioidaika/vmf-preupload/internal/rename"
 )
+
+func TestFailedOutcomeKeepsAppliedJournalAttentionVisibleAndGuardsApply(t *testing.T) {
+	application := NewApp()
+	application.journal = &rename.Journal{
+		Path:  filepath.Join(t.TempDir(), "applied.json"),
+		State: rename.JournalApplied,
+	}
+	application.journalAttention = true
+
+	if !application.HasUndoJournal() {
+		t.Fatal("an applied journal from a failed operation outcome must keep Undo visible")
+	}
+	if !application.UndoNeedsAttention() {
+		t.Fatal("an applied journal from a failed operation outcome must require attention")
+	}
+	if err := application.ApplyRename(RenamePlan{}); err == nil || !strings.Contains(strings.ToLower(err.Error()), "previous transaction") {
+		t.Fatalf("a new Apply must be blocked until the failed outcome is resolved, got %v", err)
+	}
+}
+
+func TestFailedOutcomeKeepsRolledBackJournalUndoVisible(t *testing.T) {
+	application := NewApp()
+	application.journal = &rename.Journal{
+		Path:  filepath.Join(t.TempDir(), "rolled-back.json"),
+		State: rename.JournalRolledBack,
+	}
+	application.journalAttention = true
+
+	if !application.HasUndoJournal() {
+		t.Fatal("a failed operation outcome must keep retryable Undo visible even when the last journal state says rolled back")
+	}
+	if !application.UndoNeedsAttention() {
+		t.Fatal("a failed operation outcome must remain attention-worthy even when the last journal state says rolled back")
+	}
+}
 
 func TestRenamePlanJSONIncludesEmptyCollections(t *testing.T) {
 	data, err := json.Marshal(RenamePlan{

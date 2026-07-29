@@ -116,9 +116,12 @@ container stays in place and every recognized season folder is planned as its
 own P2P release. Nested content remains below the matching renamed season.
 
 A flat series container holding files from several seasons also stays in
-place; every file uses its own parsed season/episode instead of inheriting S01
-from the first scan. The app does not create new season directories for this
-flat layout yet. Subtitle/NFO/image sidecars are not independently renamed.
+place. Build plan creates one P2P season-pack folder per detected season and
+moves every renamed episode into its matching folder instead of inheriting S01
+from the first scan. These folder creations and moves share the same journal,
+so Undo restores the original flat layout and removes only empty folders that
+the transaction created. Subtitle/NFO/image sidecars are not independently
+renamed.
 
 ## Provider keys and local settings
 
@@ -155,13 +158,17 @@ not a runtime dependency.
 The preservation classifier is intentionally conservative and order
 independent: it requires a real trailing release group, resolution, a movie
 year or TV marker, and a release-type-specific codec/source signature. A
-preserved item is shown in the plan but creates no rename operation; Apply is
-disabled when the complete plan contains no changes.
+preserved basename creates no rename operation unless the file must move into
+a newly organized season folder. Apply is disabled when the complete plan
+contains no changes.
 
 ## Safety and current limits
 
 - Applying a plan changes paths but never media bytes. `REMUX` and `ENCODE`
   describe the existing release; they do not launch FFmpeg.
+- Newly organized season folders are created transactionally. Undo removes
+  only folders recorded by the journal and only when they are empty; a foreign
+  file causes a visible retryable Undo error.
 - A rename journal is kept next to the plan root as a hidden
   `.vmf-rename-*.json` file. Keep it until you no longer need Undo.
 - Do not rename a path that a torrent client is currently seeding unless the

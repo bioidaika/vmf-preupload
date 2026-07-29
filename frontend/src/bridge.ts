@@ -18,6 +18,8 @@ export interface VmfBridge {
   PreviewRename(request: RenameRequest): Promise<RenamePlan>
   ApplyRename(plan: RenamePlan): Promise<void>
   UndoRename(): Promise<void>
+  HasUndoJournal(): Promise<boolean>
+  UndoNeedsAttention(): Promise<boolean>
   SearchMovie(query: string): Promise<SearchResult[]>
   SearchTV(query: string): Promise<SearchResult[]>
   ResolveTVSeries(id: string): Promise<SearchResult>
@@ -83,6 +85,8 @@ export const bridge: VmfBridge = {
   PreviewRename: method('PreviewRename'),
   ApplyRename: method('ApplyRename'),
   UndoRename: method('UndoRename'),
+  HasUndoJournal: method('HasUndoJournal'),
+  UndoNeedsAttention: method('UndoNeedsAttention'),
   SearchMovie: method('SearchMovie'),
   SearchTV: method('SearchTV'),
   ResolveTVSeries: method('ResolveTVSeries'),

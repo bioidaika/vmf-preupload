@@ -63,10 +63,15 @@ the explicit marker, preventing one episode from tagging the whole season.
 - A series container with direct `Season N`/`SNN` children is not renamed.
   Every recognized season child is rendered independently, and episode paths
   are mapped through that season folder's destination.
-- A flat container with files from multiple seasons is also kept in place.
-  Files retain the flat layout but are rendered with their own `SxxEyy` facts;
-  values from the first scanned episode are never reused as another file's
-  identity.
+- A flat container with files from multiple seasons is kept as the series
+  root. The transaction creates one P2P folder per season, then moves files
+  into the matching folder using their own `SxxEyy` facts. Undo restores the
+  flat layout and removes only transaction-created folders that are empty.
 - If a season folder conflicts with a filename (`Season 1` containing S02), or
   two siblings resolve to the same season destination, the whole plan is
   blocked before Apply.
+- A season bucket with different technical naming signatures (for example a
+  WEB-DL 1080p episode and a REMUX 2160p episode) is also blocked instead of
+  being labeled from the first file.
+- Optional pack tags such as service and `ViE`/`DUB` are emitted only when all
+  episodes in that season support the same tag, unless the user overrides it.

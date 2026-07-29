@@ -27,10 +27,13 @@ func Apply(ctx context.Context, plan Plan, options ApplyOptions) (*Journal, erro
 		plan.Version = planVersion
 	}
 	if plan.Root == "" {
-		if len(plan.Operations) > 0 {
-			paths := make([]string, 0, len(plan.Operations)*2)
+		if len(plan.Operations) > 0 || len(plan.Directories) > 0 {
+			paths := make([]string, 0, len(plan.Operations)*2+len(plan.Directories))
 			for _, op := range plan.Operations {
 				paths = append(paths, op.Source, op.Destination)
+			}
+			for _, directory := range plan.Directories {
+				paths = append(paths, directory.Path)
 			}
 			plan.Root = commonAncestor(paths)
 		} else {
@@ -58,10 +61,14 @@ func Apply(ctx context.Context, plan Plan, options ApplyOptions) (*Journal, erro
 	j := &Journal{
 		Version: planVersion, ID: id, PlanID: plan.ID, Root: plan.Root,
 		Path: journalPath, State: JournalPrepared, CreatedAt: time.Now().UTC(),
-		Operations: make([]JournalOperation, len(plan.Operations)),
+		Operations:  make([]JournalOperation, len(plan.Operations)),
+		Directories: make([]JournalDirectoryCreation, len(plan.Directories)),
 	}
 	for i, op := range plan.Operations {
 		j.Operations[i] = JournalOperation{Operation: op}
+	}
+	for i, directory := range plan.Directories {
+		j.Directories[i] = JournalDirectoryCreation{DirectoryCreation: directory}
 	}
 	if len(j.Operations) > 0 {
 		stageRoot, err := makeStageRoot(plan, id)
@@ -144,7 +151,10 @@ func Rollback(ctx context.Context, journal *Journal) error {
 	}
 	switch journal.State {
 	case JournalRolledBack:
-		return nil
+		// A directory created by this transaction may have been retained because
+		// a user added another file before Undo.  Repeated Undo is allowed to
+		// finish that cleanup later, once the directory is empty.
+		return combineErrors(nil, cleanupCreatedDirectories(journal))
 	case JournalApplied:
 		return undoApplied(ctx, journal)
 	case JournalUndoing:
@@ -204,6 +214,48 @@ func runJournal(ctx context.Context, journal *Journal, options ApplyOptions) err
 		emitProgress(options, Progress{JournalID: journal.ID, OperationID: op.ID, Phase: "stage", Source: op.Source, Destination: op.Destination, Completed: completed + 1, Total: len(stageOrder)})
 		if err := persistJournal(journal); err != nil {
 			return failAndRollback(ctx, journal, fmt.Errorf("record staged operation: %w", err))
+		}
+	}
+
+	// Create every explicitly planned destination directory after all sources
+	// are safely staged and before any destination is committed.  os.Mkdir is
+	// intentional: every missing level must be present in the plan and journal,
+	// so rollback never guesses which directories belong to the application.
+	directoryOrder := journalDirectoryOrder(journal.Directories, false)
+	for completed, index := range directoryOrder {
+		if err := contextErr(ctx); err != nil {
+			return failAndRollback(ctx, journal, err)
+		}
+		directory := &journal.Directories[index]
+		if directory.Created {
+			continue
+		}
+		if exists, err := pathExistsCaseInsensitive(directory.Path); err != nil {
+			return failAndRollback(ctx, journal, fmt.Errorf("inspect directory creation target %q: %w", directory.Path, err))
+		} else if exists {
+			return failAndRollback(ctx, journal, fmt.Errorf("directory creation target appeared during transaction: %s", directory.Path))
+		}
+		parent, found, err := findCaseInsensitivePath(filepath.Dir(directory.Path))
+		if err != nil {
+			return failAndRollback(ctx, journal, fmt.Errorf("inspect directory parent for %q: %w", directory.Path, err))
+		}
+		if !found {
+			return failAndRollback(ctx, journal, fmt.Errorf("directory parent disappeared: %s", filepath.Dir(directory.Path)))
+		}
+		parentInfo, err := os.Stat(parent)
+		if err != nil {
+			return failAndRollback(ctx, journal, fmt.Errorf("inspect directory parent for %q: %w", directory.Path, err))
+		}
+		if !parentInfo.IsDir() {
+			return failAndRollback(ctx, journal, fmt.Errorf("directory parent is not a directory: %s", parent))
+		}
+		if err := os.Mkdir(directory.Path, 0700); err != nil {
+			return failAndRollback(ctx, journal, fmt.Errorf("create destination directory %q: %w", directory.Path, err))
+		}
+		directory.Created = true
+		emitProgress(options, Progress{JournalID: journal.ID, OperationID: directory.ID, Phase: "mkdir", Destination: directory.Path, Completed: completed + 1, Total: len(directoryOrder)})
+		if err := persistJournal(journal); err != nil {
+			return failAndRollback(ctx, journal, fmt.Errorf("record created directory: %w", err))
 		}
 	}
 
@@ -332,6 +384,7 @@ func rollbackPartial(ctx context.Context, journal *Journal) error {
 			rollbackErrors = append(rollbackErrors, fmt.Errorf("record rollback restore: %w", err))
 		}
 	}
+	rollbackErrors = append(rollbackErrors, cleanupCreatedDirectories(journal)...)
 
 	if len(rollbackErrors) != 0 {
 		journal.State = JournalFailed
@@ -360,14 +413,16 @@ func undoApplied(ctx context.Context, journal *Journal) error {
 	if err := persistJournal(journal); err != nil {
 		return err
 	}
-	if journal.StageRoot == "" {
-		stageRoot, err := makeStageRoot(Plan{Root: journal.Root}, journal.ID+"-undo")
-		if err != nil {
-			return err
+	if len(journal.Operations) > 0 {
+		if journal.StageRoot == "" {
+			stageRoot, err := makeStageRoot(Plan{Root: journal.Root}, journal.ID+"-undo")
+			if err != nil {
+				return err
+			}
+			journal.StageRoot = stageRoot
+		} else if err := ensureDir(journal.StageRoot); err != nil {
+			return fmt.Errorf("create undo staging directory: %w", err)
 		}
-		journal.StageRoot = stageRoot
-	} else if err := ensureDir(journal.StageRoot); err != nil {
-		return fmt.Errorf("create undo staging directory: %w", err)
 	}
 
 	// Reuse the journal operation list as an inverse transaction.  Original
@@ -485,6 +540,9 @@ func undoApplied(ctx context.Context, journal *Journal) error {
 			return err
 		}
 	}
+	if cleanupErrors := cleanupCreatedDirectories(journal); len(cleanupErrors) != 0 {
+		return markUndoFailed(journal, combineErrors(fmt.Errorf("clean up created directories"), cleanupErrors))
+	}
 
 	journal.State = JournalRolledBack
 	journal.FinishedAt = time.Now().UTC()
@@ -539,6 +597,87 @@ func journalOperationOrder(ops []JournalOperation, byDestination, descending boo
 		return pathKey(lp) < pathKey(rp)
 	})
 	return indices
+}
+
+func journalDirectoryOrder(directories []JournalDirectoryCreation, descending bool) []int {
+	indices := make([]int, len(directories))
+	for i := range directories {
+		indices[i] = i
+	}
+	sort.SliceStable(indices, func(i, j int) bool {
+		left, right := directories[indices[i]], directories[indices[j]]
+		ld, rd := pathDepth(left.Path), pathDepth(right.Path)
+		if ld != rd {
+			if descending {
+				return ld > rd
+			}
+			return ld < rd
+		}
+		return pathKey(left.Path) < pathKey(right.Path)
+	})
+	return indices
+}
+
+// cleanupCreatedDirectories removes only directories which this journal
+// positively records as created, and only while they are still directories
+// and empty.  A non-empty directory is retained and reported as an incomplete
+// cleanup, keeping the journal retryable after the foreign contents have been
+// removed.  Descending depth removes children before their parents.
+func cleanupCreatedDirectories(journal *Journal) []error {
+	if journal == nil {
+		return []error{fmt.Errorf("journal is nil")}
+	}
+	var cleanupErrors []error
+	for _, index := range journalDirectoryOrder(journal.Directories, true) {
+		directory := &journal.Directories[index]
+		if !directory.Created || directory.Removed {
+			continue
+		}
+		info, err := os.Lstat(directory.Path)
+		if os.IsNotExist(err) {
+			directory.Removed = true
+			if err := persistJournal(journal); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("record missing created directory %q: %w", directory.Path, err))
+			}
+			continue
+		}
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("inspect created directory %q: %w", directory.Path, err))
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("refuse to remove created-directory path which is no longer a directory: %s", directory.Path))
+			continue
+		}
+		entries, err := os.ReadDir(directory.Path)
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("inspect created directory contents %q: %w", directory.Path, err))
+			continue
+		}
+		if len(entries) != 0 {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("created directory is not empty and was retained: %s", directory.Path))
+			continue
+		}
+		if err := os.Remove(directory.Path); err != nil {
+			if os.IsNotExist(err) {
+				directory.Removed = true
+			} else if current, readErr := os.ReadDir(directory.Path); readErr == nil && len(current) != 0 {
+				// Another process populated the directory between ReadDir and
+				// Remove.  Preserve it and leave cleanup retryable.
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("created directory became non-empty and was retained: %s", directory.Path))
+				continue
+			} else {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("remove empty created directory %q: %w", directory.Path, err))
+				continue
+			}
+		} else {
+			directory.Removed = true
+		}
+		if err := persistJournal(journal); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("record removed created directory %q: %w", directory.Path, err))
+		}
+	}
+	return cleanupErrors
 }
 
 func emitProgress(options ApplyOptions, progress Progress) {
@@ -603,6 +742,11 @@ func ensureJournalOutsideMedia(journalPath string, plan Plan) error {
 		}
 		if op.Kind == KindDir && (pathWithin(journalPath, op.Source) || pathWithin(journalPath, op.Destination)) {
 			return fmt.Errorf("journal path must be outside renamed directories: %s", journalPath)
+		}
+	}
+	for _, directory := range plan.Directories {
+		if pathKey(journalPath) == pathKey(directory.Path) || pathWithin(journalPath, directory.Path) {
+			return fmt.Errorf("journal path must be outside created directories: %s", journalPath)
 		}
 	}
 	return nil

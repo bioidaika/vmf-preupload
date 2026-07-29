@@ -22,8 +22,13 @@ var (
 )
 
 var p2pMediaExtensions = map[string]struct{}{
-	".mkv": {}, ".mp4": {}, ".m4v": {}, ".ts": {}, ".m2ts": {},
-	".mov": {}, ".avi": {}, ".webm": {},
+	".3g2": {}, ".3gp": {}, ".asf": {}, ".avi": {},
+	".divx": {}, ".f4v": {}, ".flv": {}, ".m2ts": {},
+	".m4v": {}, ".mkv": {}, ".mov": {}, ".mp4": {},
+	".mpe": {}, ".mpeg": {}, ".mpg": {}, ".mpv": {},
+	".mts": {}, ".mxf": {}, ".ogv": {}, ".rm": {},
+	".rmvb": {}, ".ts": {}, ".vob": {}, ".webm": {},
+	".wmv": {},
 }
 
 // IsP2PReleaseName reports whether filename has enough structural evidence to

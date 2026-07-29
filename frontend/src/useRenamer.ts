@@ -196,7 +196,7 @@ export function formatReleaseName(metadata: TechnicalMetadata, settings: AppSett
 
 function syntheticScan(path: string): ScanResult {
   const root = path || `C:\\Media\\${SYNTHETIC_VIDEO}`
-  const filePath = root.toLowerCase().endsWith('.mkv') || root.toLowerCase().endsWith('.mp4')
+  const filePath = /\.(?:3g2|3gp|asf|avi|divx|f4v|flv|m2ts|m4v|mkv|mov|mp4|mpe|mpeg|mpg|mpv|mts|mxf|ogv|rm|rmvb|ts|vob|webm|wmv)$/i.test(root)
     ? root
     : `${root.replace(/[\\/]$/, '')}\\${SYNTHETIC_VIDEO}`
   const hints = hintsFromFilename(filePath)
@@ -354,6 +354,9 @@ export function useRenamer(): RenamerState {
         ? ` across ${result.seasons.length} season${result.seasons.length === 1 ? '' : 's'}${result.seasonFolderCount ? ` in ${result.seasonFolderCount} season folder${result.seasonFolderCount === 1 ? '' : 's'}` : ''}`
         : ''
       setNotice(`Scanned ${result.files.length} item${result.files.length === 1 ? '' : 's'}${seasonSummary}${warningCount ? ` with ${warningCount} warning${warningCount === 1 ? '' : 's'}` : ''}.`)
+      if (result.scanComplete === false) {
+        setError('Filesystem inventory is incomplete. Resolve the scan warnings before building or applying a plan.')
+      }
     } catch (cause) {
       if (isBridgeError(cause)) {
         // Browser-only hosts have no filesystem bridge. Keep the design-time

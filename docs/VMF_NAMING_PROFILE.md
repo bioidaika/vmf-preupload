@@ -75,3 +75,20 @@ the explicit marker, preventing one episode from tagging the whole season.
   being labeled from the first file.
 - Optional pack tags such as service and `ViE`/`DUB` are emitted only when all
   episodes in that season support the same tag, unless the user overrides it.
+- Regular files which are not upload video payloads are separated from season
+  torrents. Series containers use `<series>/Extras/<original relative path>`;
+  selected movie/single-season release roots use
+  `<parent>/Extras/<release name>/<original relative path>` so Extras remains
+  outside the folder submitted to the tracker.
+- Excluded sample videos (a final `sample` token or a `Sample` directory) and
+  files below an existing `Extras` or hidden directory follow the same Extras
+  policy. A leading, series-level `Extras` component is stripped when mapping
+  destinations, making repeated previews idempotent rather than producing
+  `Extras/Extras`.
+- Extras moves use the same transaction journal as release renames. Undo puts
+  every file back and removes only empty directories created by that journal;
+  symlinks and special filesystem entries are never moved automatically.
+- The preview records a lightweight filesystem snapshot (without rerunning
+  MediaInfo). Apply is blocked if the selected tree changed or traversal was
+  incomplete, preventing a newly arrived sidecar from being carried into a
+  renamed torrent folder invisibly.

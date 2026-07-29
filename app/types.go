@@ -39,6 +39,7 @@ type ScanResult struct {
 	MediaType         string            `json:"mediaType"`
 	Files             []ScanFile        `json:"files"`
 	Metadata          TechnicalMetadata `json:"metadata"`
+	ScanComplete      bool              `json:"scanComplete"`
 	Seasons           []string          `json:"seasons"`
 	SeriesRoot        bool              `json:"seriesRoot"`
 	SeasonFolderCount int               `json:"seasonFolderCount"`

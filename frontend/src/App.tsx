@@ -184,7 +184,7 @@ export default function App() {
             <div className="drop-icon"><Icon name="folder" size={25} /></div>
             <div className="drop-copy"><strong>{renamer.scan?.rootPath ? 'Media selected' : 'Drop a movie or TV folder here'}</strong><span>{renamer.selectedPath || 'Choose a video file or a complete folder to start scanning.'}</span></div>
             <div className="drop-actions"><button className="button secondary" onClick={() => renamer.bridgeConnected ? void renamer.chooseFile() : fileInput.current?.click()}><Icon name="file" size={15} /> Choose file</button><button className="button secondary" onClick={() => renamer.bridgeConnected ? void renamer.chooseFolder() : folderInput.current?.click()}><Icon name="folder" size={15} /> Choose folder</button></div>
-            <input ref={fileInput} className="visually-hidden" type="file" accept="video/*,.mkv,.mp4,.m4v,.ts" onChange={(event) => pickFiles(event.target.files)} />
+            <input ref={fileInput} className="visually-hidden" type="file" accept="video/*,.mkv,.mp4,.m4v,.ts,.m2ts,.mts,.mpg,.mpeg,.avi,.wmv,.webm,.mov,.vob,.flv,.mxf" onChange={(event) => pickFiles(event.target.files)} />
             <input ref={folderInput} className="visually-hidden" type="file" /* Chromium supports directory selection via these non-standard attributes. */ {...{ webkitdirectory: '', directory: '' }} onChange={(event) => pickFiles(event.target.files)} />
           </section>
 
@@ -207,7 +207,7 @@ export default function App() {
 }
 
 function RenameRow({ item }: { item: RenameItem }) {
-  const oldName = item.status === 'create' ? 'New season folder' : item.oldPath.split(/[\\/]/).pop() ?? item.oldPath
+  const oldName = item.status === 'create' ? 'New folder' : item.oldPath.split(/[\\/]/).pop() ?? item.oldPath
   const newName = item.newPath.split(/[\\/]/).pop() ?? item.newPath
   const showParentMove = oldName === newName && pathKey(item.oldPath) !== pathKey(item.newPath)
   return <div className="rename-row"><div className="path-cell old"><span className="path-icon"><Icon name={item.kind === 'folder' ? 'folder' : 'file'} size={15} /></span><span className="path-copy" title={item.oldPath}><span>{oldName}</span>{showParentMove && <small>{parentLabel(item.oldPath)}</small>}</span></div><Icon name="arrow" size={15} /><div className="path-cell new"><span className="path-icon"><Icon name={item.kind === 'folder' ? 'folder' : 'file'} size={15} /></span><span className="path-copy" title={item.newPath}><span>{newName}</span>{showParentMove && <small>{parentLabel(item.newPath)}</small>}</span></div><StatusBadge status={item.status} /></div>

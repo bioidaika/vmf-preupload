@@ -103,9 +103,29 @@ type Asset struct {
 	Warnings     []string      `json:"warnings,omitempty"`
 }
 
+// ExtraFile is a regular, non-payload filesystem item discovered beside the
+// selected media. It is intentionally kept separate from Asset: callers must
+// never parse an NFO, subtitle, image, or excluded sample as release metadata
+// or invoke MediaInfo for it. RelativePath lets the planner preserve
+// subdirectories below Extras and avoid flattening unrelated files onto the
+// same destination basename.
+type ExtraFile struct {
+	Path         string    `json:"path"`
+	RelativePath string    `json:"relativePath,omitempty"`
+	Name         string    `json:"name"`
+	Kind         string    `json:"kind"` // audio, subtitle, image, or other
+	Size         int64     `json:"size,omitempty"`
+	ModifiedAt   time.Time `json:"modifiedAt,omitempty"`
+}
+
 type ScanResult struct {
-	Root     string   `json:"root"`
-	Assets   []Asset  `json:"assets"`
+	Root       string      `json:"root"`
+	Assets     []Asset     `json:"assets"`
+	ExtraFiles []ExtraFile `json:"extraFiles"`
+	// Complete is false when filesystem traversal could not inspect part of
+	// the selected tree. A planner must not apply a directory rename from an
+	// incomplete inventory because unseen sidecars could enter the release.
+	Complete bool     `json:"complete"`
 	Warnings []string `json:"warnings,omitempty"`
 }
 

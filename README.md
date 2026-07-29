@@ -120,8 +120,21 @@ place. Build plan creates one P2P season-pack folder per detected season and
 moves every renamed episode into its matching folder instead of inheriting S01
 from the first scan. These folder creations and moves share the same journal,
 so Undo restores the original flat layout and removes only empty folders that
-the transaction created. Subtitle/NFO/image sidecars are not independently
-renamed.
+the transaction created.
+
+Files which are not upload video payloads are isolated from the release plan.
+NFO, images, subtitles, external audio, excluded samples, and other regular
+files are moved below `Extras` while retaining their relative source paths. A
+series container uses `<series>/Extras`; because a movie or selected
+single-season folder is itself the torrent root, it uses the sibling namespace
+`<parent>/Extras/<release name>` instead. Files already below a series-level
+`Extras` folder are no-ops on the next preview. Apply and Undo journal these
+moves together with the video/folder operations. Symlinks and other special
+filesystem entries are left untouched and reported as scan warnings.
+
+The plan also keeps a lightweight filesystem snapshot. If files or folders are
+added, removed, or changed after preview, Apply stops and asks for a fresh
+plan; an incomplete/unreadable scan cannot be applied.
 
 ## Provider keys and local settings
 
@@ -169,11 +182,17 @@ contains no changes.
 - Newly organized season folders are created transactionally. Undo removes
   only folders recorded by the journal and only when they are empty; a foreign
   file causes a visible retryable Undo error.
+- Extra regular files are moved outside upload release folders under `Extras`.
+  Their relative paths are kept so same-named artwork from different seasons
+  cannot overwrite one another.
 - A rename journal is kept next to the plan root as a hidden
   `.vmf-rename-*.json` file. Keep it until you no longer need Undo.
 - Do not rename a path that a torrent client is currently seeding unless the
   torrent is intentionally being rebuilt; a path change changes torrent
   metadata even when bytes are identical.
+- Keep the selected tree stable while Apply or Undo is running; the preview
+  guard rejects changes detected before staging, but it is not a filesystem
+  lock against another process modifying paths mid-transaction.
 - TVDB currently searches series; episode title/number may need confirmation
   in the metadata panel.
 

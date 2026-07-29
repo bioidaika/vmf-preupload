@@ -37,6 +37,7 @@ export interface ScanResult {
   mediaType: MediaType
   files: ScanFile[]
   metadata: Partial<TechnicalMetadata>
+  scanComplete?: boolean
   seasons?: string[]
   seriesRoot?: boolean
   seasonFolderCount?: number

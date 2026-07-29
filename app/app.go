@@ -32,6 +32,7 @@ type App struct {
 	planID       string
 	planCanApply bool
 	journal      *rename.Journal
+	planSnapshot *filesystemSnapshot
 	// journalAttention records a failed Apply/Undo outcome independently of
 	// the last journal state we could persist or reload. In particular, the
 	// in-memory state can already be "applied" when the final journal write
@@ -88,8 +89,8 @@ func (a *App) SelectFile() (string, error) {
 	return runtime.OpenFileDialog(a.context(), runtime.OpenDialogOptions{
 		Title: "Choose a media file",
 		Filters: []runtime.FileFilter{{
-			DisplayName: "Media files (*.mkv;*.mp4;*.m4v;*.ts;*.m2ts;*.avi;*.webm)",
-			Pattern:     "*.mkv;*.mp4;*.m4v;*.ts;*.m2ts;*.avi;*.webm",
+			DisplayName: "Media files (*.mkv;*.mp4;*.m4v;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.avi;*.wmv;*.webm)",
+			Pattern:     "*.mkv;*.mp4;*.m4v;*.ts;*.m2ts;*.mts;*.mpg;*.mpeg;*.avi;*.wmv;*.webm;*.mov;*.vob;*.flv;*.mxf",
 		}},
 	})
 }
@@ -116,9 +117,23 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 	if root == "" {
 		return RenamePlan{}, fmt.Errorf("root path is empty")
 	}
+	beforeScanSnapshot, err := captureFilesystemSnapshot(root)
+	if err != nil {
+		return RenamePlan{}, err
+	}
 	scan, err := scanner.ScanPath(a.context(), root, a.currentSettings().MediaInfoBin)
 	if err != nil {
 		return RenamePlan{}, err
+	}
+	if !scan.Complete {
+		return RenamePlan{}, fmt.Errorf("scan incomplete; resolve the filesystem warnings and build the plan again")
+	}
+	previewSnapshot, err := captureFilesystemSnapshot(root)
+	if err != nil {
+		return RenamePlan{}, err
+	}
+	if !beforeScanSnapshot.Equal(previewSnapshot) {
+		return RenamePlan{}, fmt.Errorf("selected paths changed while scanning; build the plan again after the files are stable")
 	}
 	profile := naming.DefaultProfile()
 	profile.Separator = request.Separator
@@ -149,8 +164,8 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 	rootIsDir := rootInfo.IsDir()
 	parent := filepath.Dir(root)
 	newRoot := root
-	requests := make([]rename.RenameRequest, 0, len(scan.Assets)+1)
-	displayItems := make([]RenameItem, 0, len(scan.Assets)+1)
+	requests := make([]rename.RenameRequest, 0, len(scan.Assets)+len(scan.ExtraFiles)+1)
+	displayItems := make([]RenameItem, 0, len(scan.Assets)+len(scan.ExtraFiles)+1)
 	warnings := append([]string{}, scan.Warnings...)
 	planErrors := []string{}
 	seasonLayout := tvSeasonLayout{}
@@ -387,6 +402,25 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 			requests = append(requests, rename.RenameRequest{Source: asset.Path, Destination: destination})
 		}
 	}
+	if rootIsDir && len(scan.ExtraFiles) > 0 {
+		extraPlan := buildExtraMovePlan(root, newRoot, seasonLayout.SeriesRoot, scan.ExtraFiles, seenDest, createDirectories)
+		requests = append(requests, extraPlan.Requests...)
+		createDirectories = append(createDirectories, extraPlan.CreateDirectories...)
+		displayItems = append(displayItems, extraPlan.DisplayItems...)
+		for _, message := range extraPlan.Errors {
+			appendUnique(&planErrors, message)
+		}
+		for path := range extraPlan.ConflictingPaths {
+			conflictingFileDestinations[path] = true
+		}
+		if extraPlan.MovedFileCount > 0 {
+			appendUnique(&warnings, fmt.Sprintf(
+				"%d extra file(s) will be isolated under %s and excluded from release folders",
+				extraPlan.MovedFileCount,
+				extraPlan.DestinationDirectory,
+			))
+		}
+	}
 	if len(requests) == 0 {
 		// BuildPlan intentionally filters exact no-ops. Supplying one here gives
 		// the GUI a stable plan ID while displayItems explains why no filesystem
@@ -423,6 +457,7 @@ func (a *App) PreviewRename(request RenameRequest) (RenamePlan, error) {
 	a.plan = plan
 	a.planID = result.ID
 	a.planCanApply = result.CanApply
+	a.planSnapshot = &previewSnapshot
 	a.mu.Unlock()
 	return result, nil
 }
@@ -432,6 +467,7 @@ func (a *App) ApplyRename(plan RenamePlan) error {
 	internalPlan := a.plan
 	knownID := a.planID
 	canApply := a.planCanApply
+	plannedSnapshot := a.planSnapshot
 	previousJournal := a.journal
 	previousJournalAttention := a.journalAttention
 	a.mu.Unlock()
@@ -446,6 +482,15 @@ func (a *App) ApplyRename(plan RenamePlan) error {
 	}
 	if !canApply {
 		return fmt.Errorf("rename plan has unresolved errors; refresh the preview after fixing them")
+	}
+	if plannedSnapshot != nil {
+		currentSnapshot, snapshotErr := captureFilesystemSnapshot(plannedSnapshot.Root)
+		if snapshotErr != nil {
+			return fmt.Errorf("selected paths changed or became unreadable since preview: %w", snapshotErr)
+		}
+		if !plannedSnapshot.Equal(currentSnapshot) {
+			return fmt.Errorf("selected paths changed since preview; refresh the plan before applying")
+		}
 	}
 	journal, err := rename.Apply(a.context(), internalPlan, rename.ApplyOptions{})
 	if journal != nil && journal.State != rename.JournalRolledBack {
@@ -556,7 +601,7 @@ func (a *App) toScanResult(result api.ScanResult) ScanResult {
 	if fallbackGroup == "" {
 		fallbackGroup = "NoGroup"
 	}
-	out := ScanResult{RootPath: result.Root, Files: []ScanFile{}, Seasons: []string{}, Warnings: []string{}, Metadata: TechnicalMetadata{MediaType: "movie", Group: fallbackGroup}}
+	out := ScanResult{RootPath: result.Root, Files: []ScanFile{}, Seasons: []string{}, Warnings: []string{}, ScanComplete: result.Complete, Metadata: TechnicalMetadata{MediaType: "movie", Group: fallbackGroup}}
 	for _, warning := range result.Warnings {
 		appendUnique(&out.Warnings, warning)
 	}
@@ -592,6 +637,9 @@ func (a *App) toScanResult(result api.ScanResult) ScanResult {
 				out.MediaInfoText = asset.Technical.RawJSON
 			}
 		}
+	}
+	for _, file := range result.ExtraFiles {
+		out.Files = append(out.Files, ScanFile{Path: file.Path, Kind: file.Kind, Size: file.Size})
 	}
 	if out.Metadata.MediaType == "" {
 		out.Metadata.MediaType = "movie"
@@ -652,10 +700,17 @@ func appendUnique(values *[]string, value string) {
 func (a *App) toRenamePlan(plan rename.Plan, warnings []string, report rename.ValidationReport, displayItems []RenameItem) RenamePlan {
 	out := RenamePlan{ID: plan.ID, Items: []RenameItem{}, ChangeCount: len(plan.Operations) + len(plan.Directories), Warnings: append([]string{}, warnings...), Errors: []string{}}
 	conflictingDirectories := map[string]bool{}
+	conflictingSources := map[string]bool{}
+	conflictingDestinations := map[string]bool{}
 	for _, issue := range report.Issues {
 		out.Errors = append(out.Errors, issue.Code+": "+issue.Message)
+		if issue.Path != "" {
+			conflictingSources[appPathKey(issue.Path)] = true
+		}
 		if issue.Destination != "" {
-			conflictingDirectories[appPathKey(issue.Destination)] = true
+			key := appPathKey(issue.Destination)
+			conflictingDirectories[key] = true
+			conflictingDestinations[key] = true
 		}
 	}
 	for _, directory := range plan.Directories {
@@ -670,7 +725,11 @@ func (a *App) toRenamePlan(plan rename.Plan, warnings []string, report rename.Va
 		if op.Kind == rename.KindDir {
 			kind = "folder"
 		}
-		out.Items = append(out.Items, RenameItem{OldPath: op.Source, NewPath: op.Destination, Kind: kind, Status: "ready"})
+		status := "ready"
+		if conflictingSources[appPathKey(op.Source)] || conflictingDestinations[appPathKey(op.Destination)] {
+			status = "conflict"
+		}
+		out.Items = append(out.Items, RenameItem{OldPath: op.Source, NewPath: op.Destination, Kind: kind, Status: status})
 	}
 	out.Items = append(out.Items, displayItems...)
 	out.CanApply = out.ChangeCount > 0 && len(out.Errors) == 0
@@ -1015,7 +1074,7 @@ func appendNamingWarnings(values []string, warnings []naming.Warning) []string {
 func isVideoAsset(asset api.Asset) bool {
 	ext := strings.ToLower(filepath.Ext(asset.Path))
 	switch ext {
-	case ".mkv", ".mp4", ".m4v", ".ts", ".m2ts", ".mov", ".avi", ".webm":
+	case ".3g2", ".3gp", ".asf", ".avi", ".divx", ".f4v", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpe", ".mpeg", ".mpg", ".mpv", ".mts", ".mxf", ".ogv", ".rm", ".rmvb", ".ts", ".vob", ".webm", ".wmv":
 		return true
 	}
 	return ext == ""
